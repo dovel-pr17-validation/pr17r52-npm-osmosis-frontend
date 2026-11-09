@@ -2729,7 +2729,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@chain-registry/types@npm:^0.46.0, @chain-registry/types@npm:^0.46.11":
+"@chain-registry/types@npm:^0.46.11":
   version: 0.46.15
   resolution: "@chain-registry/types@npm:0.46.15"
   checksum: 10c0/11655ead021fcc78f317f682842a73666e080216d22f87be5b9fffa9341130b3e8b8a3b1d2d77ec3c41841af4c1fbdf24af467ef12df552fa2e99fe2eae5f1e1
@@ -2740,6 +2740,13 @@ __metadata:
   version: 0.50.345
   resolution: "@chain-registry/types@npm:0.50.345"
   checksum: 10c0/f1bdc58438c524c094ebcf28c48e33ebf6b8047f4155469036ce2462e40874df9e55cfa9af258599d6e086caf05e3b6f8f7aa0c939c8771eda208184dc07a6de
+  languageName: node
+  linkType: hard
+
+"@chain-registry/types@npm:^2.0.285":
+  version: 2.0.285
+  resolution: "@chain-registry/types@npm:2.0.285"
+  checksum: 10c0/587072ae0d3c6aefa3955484475d0f05128eaa702204405ad2b9b9b9c241186aae218c863baf5dea1b7b9e4faa15c26b6f2a5b35dba773822c49f01c76698edc
   languageName: node
   linkType: hard
 
@@ -6628,7 +6635,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@osmosis-labs/tx@workspace:packages/tx"
   dependencies:
-    "@chain-registry/types": "npm:^0.46.0"
+    "@chain-registry/types": "npm:^2.0.285"
     "@cosmjs/amino": "npm:0.36.2"
     "@cosmjs/encoding": "npm:0.36.2"
     "@cosmjs/math": "npm:0.36.2"
@@ -6712,7 +6719,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@osmosis-labs/web@workspace:packages/web"
   dependencies:
-    "@chain-registry/types": "npm:^0.46.0"
+    "@chain-registry/types": "npm:^2.0.285"
     "@cosmjs/amino": "npm:0.36.2"
     "@cosmjs/encoding": "npm:0.36.2"
     "@cosmjs/proto-signing": "npm:0.36.2"
