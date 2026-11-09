@@ -1,0 +1,692 @@
+import { DEFAULT_VS_CURRENCY } from "@osmosis-labs/server";
+import { prepareCollectAllPositionsRewardsMsgs } from "@osmosis-labs/tx";
+import type { ConcentratedPoolRawResponse } from "@osmosis-labs/types";
+import { CoinPretty, Dec, PricePretty } from "@osmosis-labs/unit";
+import classNames from "classnames";
+import dynamic from "next/dynamic";
+import Image from "next/image";
+import { FunctionComponent, memo, useEffect, useMemo, useState } from "react";
+import { useSearchParam } from "react-use";
+
+import { Icon, PoolAssetsIcon, PoolAssetsName } from "~/components/assets";
+import {
+  ChartUnavailable,
+  PriceChartHeader,
+} from "~/components/chart/price-historical";
+import { MyPositionsSection } from "~/components/complex/my-positions-section";
+import { SuperchargePool } from "~/components/funnels/concentrated-liquidity";
+import { Spinner } from "~/components/loaders/spinner";
+import { Button, ChartButton } from "~/components/ui/button";
+import { EntityImage } from "~/components/ui/entity-image";
+import { useFeatureFlags, useTranslation, useWalletSelect } from "~/hooks";
+import {
+  type HistoricalAndLiquidityData,
+  useHistoricalAndLiquidityData,
+  useHoverPrice,
+} from "~/hooks/ui-config/use-historical-and-depth-data";
+import { useWallet } from "~/hooks/use-wallet";
+import { AddLiquidityModal, IncentivizePoolModal } from "~/modals";
+import { ConcentratedLiquidityLearnMoreModal } from "~/modals/concentrated-liquidity-intro";
+import { formatPretty, getPriceExtendedFormatOptions } from "~/utils/formatter";
+import { api } from "~/utils/trpc";
+import { removeQueryParam } from "~/utils/url";
+
+import { AprBreakdown } from "../cards/apr-breakdown";
+import { SkeletonLoader } from "../loaders/skeleton-loader";
+
+const ConcentratedLiquidityDepthChart = dynamic(
+  () =>
+    import("~/components/chart/concentrated-liquidity-depth").then(
+      (module) => module.ConcentratedLiquidityDepthChart
+    ),
+  { ssr: false }
+);
+const HistoricalPriceChart = dynamic(
+  () =>
+    import("~/components/chart/price-historical").then(
+      (module) => module.HistoricalPriceChart
+    ),
+  { ssr: false }
+);
+
+const OpenCreatePositionSearchParam = "open_create_position";
+
+export const ConcentratedLiquidityPool: FunctionComponent<{ poolId: string }> =
+  memo(({ poolId }) => {
+    const { t } = useTranslation();
+    const { isLoading: isWalletLoading } = useWalletSelect();
+    const { incentivizePool } = useFeatureFlags();
+    const { address, signAndBroadcast, transactionContext } = useWallet();
+    const openCreatePosition = useSearchParam(OpenCreatePositionSearchParam);
+
+    const chartConfig = useHistoricalAndLiquidityData(poolId);
+    const [activeModal, setActiveModal] = useState<
+      "add-liquidity" | "learn-more" | "incentivize" | null
+    >(null);
+
+    // Query pool data for state detection
+    const { data: poolData } = api.local.pools.getPool.useQuery({ poolId });
+
+    const { data: superfluidPoolIds } =
+      api.edge.pools.getSuperfluidPoolIds.useQuery();
+
+    const { data: userPositions, isFetched: isUserPositionsFetched } =
+      api.local.concentratedLiquidity.getUserPositions.useQuery(
+        {
+          userOsmoAddress: address ?? "",
+          forPoolId: poolId,
+        },
+        {
+          enabled: !isWalletLoading && Boolean(address),
+        }
+      );
+
+    const userHasPositionInPool = userPositions && userPositions.length > 0;
+
+    const claimableSpreadRewardPositions = useMemo(
+      () =>
+        userPositions?.filter(
+          ({ position }) => position.claimable_spread_rewards.length > 0
+        ) ?? [],
+      [userPositions]
+    );
+    const claimableIncentivePositions = useMemo(
+      () =>
+        userPositions?.filter(
+          ({ position }) => position.claimable_incentives.length > 0
+        ) ?? [],
+      [userPositions]
+    );
+    const hasClaimableRewards =
+      claimableSpreadRewardPositions.length > 0 ||
+      claimableIncentivePositions.length > 0;
+
+    const {
+      pool,
+      currentPrice,
+      xRange,
+      yRange,
+      lastChartData,
+      depthChartData,
+      resetZoom,
+      zoomIn,
+      zoomOut,
+    } = chartConfig;
+
+    const onClickCollectAllRewards = () => {
+      prepareCollectAllPositionsRewardsMsgs(
+        transactionContext,
+        claimableSpreadRewardPositions.map(({ id }) => id),
+        claimableIncentivePositions.map(({ id }) => id),
+        undefined
+      )
+        .then((prepared) => signAndBroadcast(...prepared))
+        .catch(console.error);
+    };
+
+    useEffect(() => {
+      if (openCreatePosition === "true") {
+        // eslint-disable-next-line hooks-compat/set-state-in-effect -- one-shot deep link: opens the modal and strips the query param together
+        setActiveModal("add-liquidity");
+        removeQueryParam(OpenCreatePositionSearchParam);
+      }
+    }, [openCreatePosition]);
+
+    const formatOpts = useMemo(
+      () => getPriceExtendedFormatOptions(currentPrice),
+      [currentPrice]
+    );
+
+    // Pool state detection based on liquidity
+    const poolRaw =
+      poolData?.type === "concentrated"
+        ? (poolData.raw as ConcentratedPoolRawResponse)
+        : null;
+    const currentSqrtPrice = poolRaw?.current_sqrt_price;
+    const currentTickLiquidity = poolRaw?.current_tick_liquidity;
+    const hasTVL =
+      poolData &&
+      (poolData.tvlUnknown || !poolData.totalFiatValueLocked.toDec().isZero());
+
+    // Check if values are zero (handles both "0" and "0.000000..." strings)
+    const isSqrtPriceZero = currentSqrtPrice
+      ? parseFloat(currentSqrtPrice) === 0
+      : false;
+    const isTickLiquidityZero = currentTickLiquidity
+      ? parseFloat(currentTickLiquidity) === 0
+      : false;
+
+    // Tier 1: Uninitialized Pool - has never been initialized (no first
+    // position created). On Osmosis CL, current_sqrt_price only becomes
+    // non-zero when the first position is created, so this is a reliable
+    // chain-derived signal regardless of whether TVL is known. Avoid relying
+    // on hasTVL here so a future regression in the TVL signal cannot route
+    // an uninitialized pool into the inactive flow.
+    const isUninitializedPool = isSqrtPriceZero && isTickLiquidityZero;
+
+    // Tier 2: Inactive Pool - has TVL but no in range liquidity at current price
+    // This happens when all liquidity positions are out of range. Made
+    // mutually exclusive with the uninitialized tier above so a pool with
+    // zero sqrt price never registers as inactive.
+    const isInactivePool =
+      !isUninitializedPool && isTickLiquidityZero && hasTVL;
+
+    return (
+      <main className="m-auto flex min-h-screen max-w-container flex-col gap-8 px-8 py-4 md:gap-4 md:p-4">
+        {pool && activeModal === "add-liquidity" && (
+          <AddLiquidityModal
+            isOpen={true}
+            poolId={pool.id}
+            onRequestClose={() => setActiveModal(null)}
+          />
+        )}
+        {pool && incentivizePool && activeModal === "incentivize" && (
+          <IncentivizePoolModal
+            isOpen={true}
+            poolId={pool.id}
+            isConcentrated={true}
+            onRequestClose={() => setActiveModal(null)}
+          />
+        )}
+        <section className="flex flex-col gap-8">
+          <div className="flex flex-col rounded-3xl p-8">
+            <div className="flex flex-row lg:flex-col lg:gap-3">
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <PoolAssetsIcon
+                    className="!w-[78px]"
+                    assets={pool?.reserveCoins.map((coin) => ({
+                      coinImageUrl: coin.currency.coinImageUrl,
+                      coinDenom: coin.currency.coinDenom,
+                      coinMinimalDenom: coin.currency.coinMinimalDenom,
+                    }))}
+                  />
+                  <div className="flex flex-wrap gap-x-2">
+                    <PoolAssetsName
+                      size="md"
+                      className="text-h5 font-h5"
+                      assetDenoms={pool?.reserveCoins.map(
+                        ({ denom, currency }) => ({
+                          minDenom: currency.coinMinimalDenom,
+                          symbol: denom,
+                        })
+                      )}
+                    />
+                    <span className="hidden py-1 text-subtitle1 text-osmoverse-100 lg:inline-block">
+                      {pool?.spreadFactor ? pool.spreadFactor.toString() : "0%"}{" "}
+                      {t("clPositions.spreadFactor")}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center gap-1.5 text-ion-400">
+                    <Icon id="lightning-small" height={18} width={18} />
+                    <span className="body2">
+                      {t("clPositions.supercharged")}
+                    </span>
+                  </div>
+                  {superfluidPoolIds?.includes(poolId) && (
+                    <span className="body2 text-supercharged-gradient flex items-center gap-1.5">
+                      <Image
+                        alt=""
+                        src="/icons/superfluid-osmo.svg"
+                        height={18}
+                        width={18}
+                      />
+                      {t("pool.superfluidEnabled")}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex flex-grow justify-end gap-10 lg:justify-start xs:flex-col xs:gap-4">
+                {!isUninitializedPool && !isInactivePool && pool && (
+                  <PoolDataGroup
+                    label={t("pool.24hrTradingVolume")}
+                    value={
+                      pool.market?.volume24hUsd
+                        ? formatPretty(pool.market.volume24hUsd)
+                        : "–"
+                    }
+                  />
+                )}
+                <PoolDataGroup
+                  label={t("pool.liquidity")}
+                  value={
+                    pool?.tvlUnknown
+                      ? "–"
+                      : pool?.totalFiatValueLocked
+                        ? formatPretty(pool.totalFiatValueLocked)
+                        : "0"
+                  }
+                />
+
+                <div className="lg:hidden">
+                  <PoolDataGroup
+                    label={t("clPositions.spreadFactor")}
+                    value={
+                      pool?.spreadFactor ? pool.spreadFactor.toString() : "0%"
+                    }
+                  />
+                </div>
+              </div>
+            </div>
+            {!isUninitializedPool && !isInactivePool && (
+              <div className="flex h-[340px] flex-row">
+                <div className="flex-shrink-1 flex w-0 flex-1 flex-col gap-[20px] py-7 sm:py-3">
+                  {chartConfig.isHistoricalDataLoading ? (
+                    <Spinner className="m-auto" />
+                  ) : !chartConfig.historicalChartUnavailable ? (
+                    <>
+                      <ChartHeader config={chartConfig} />
+                      <Chart config={chartConfig} />
+                    </>
+                  ) : (
+                    <ChartUnavailable />
+                  )}
+                </div>
+
+                <div className="flex-shrink-1 relative flex w-[229px] flex-col">
+                  <div className="mt-7 flex h-6 justify-end gap-1 pr-8 sm:pr-0">
+                    <ChartButton
+                      alt="refresh"
+                      icon="refresh-ccw"
+                      selected={false}
+                      onClick={() => resetZoom()}
+                    />
+                    <ChartButton
+                      alt="zoom out"
+                      icon="zoom-out"
+                      selected={false}
+                      onClick={zoomOut}
+                    />
+                    <ChartButton
+                      alt="zoom in"
+                      icon="zoom-in"
+                      selected={false}
+                      onClick={zoomIn}
+                    />
+                  </div>
+                  <div className="mt-8 flex flex-1 flex-col">
+                    <ConcentratedLiquidityDepthChart
+                      yRange={yRange}
+                      xRange={xRange}
+                      data={depthChartData}
+                      annotationDatum={{
+                        price: currentPrice
+                          ? Number(currentPrice.toString())
+                          : (lastChartData?.close ?? 0),
+                        depth: xRange[1],
+                      }}
+                      annotationLabel={
+                        currentPrice
+                          ? formatPretty(currentPrice, formatOpts)
+                          : undefined
+                      }
+                      offset={{
+                        top: 0,
+                        bottom: 24 + 28,
+                        left: 0,
+                      }}
+                      horizontal
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+          {!isInactivePool && !isUninitializedPool && (
+            <UserAssetsAndExternalIncentives
+              poolId={poolId}
+              onIncentivize={() => setActiveModal("incentivize")}
+            />
+          )}
+          {isUninitializedPool || isInactivePool ? (
+            <div className="flex flex-col items-center gap-4 pt-8">
+              {isInactivePool && (
+                <div className="flex flex-col items-center gap-2 pb-4 text-center">
+                  <h6 className="text-h6 font-h6">
+                    {t("pool.inactivePool.title")}
+                  </h6>
+                  <p className="max-w-md whitespace-pre-line text-body2 text-osmoverse-200">
+                    {t("pool.inactivePool.description")}
+                  </p>
+                </div>
+              )}
+              <Button
+                className="subtitle1 w-fit"
+                onClick={() => {
+                  setActiveModal("add-liquidity");
+                }}
+              >
+                {isInactivePool
+                  ? t("pool.inactivePool.addLiquidity")
+                  : t("pool.initializePool")}
+              </Button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-8">
+              <div className="flex flex-row md:flex-wrap md:gap-y-4">
+                <div className="flex flex-grow flex-col gap-3">
+                  <h6>{t("clPositions.yourPositions")}</h6>
+                  <div className="flex items-center text-body2 font-body2">
+                    <span className="text-osmoverse-200">
+                      {t("clPositions.yourPositionsDesc")}
+                    </span>
+                    {/* <span className="flex flex-row">
+                      <a
+                        className="mx-1 inline-flex items-center text-wosmongton-300 underline"
+                        href="#"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {t("clPositions.learnMoreAboutPools")}
+                      </a>
+                    </span> */}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    className="subtitle1 w-fit"
+                    onClick={onClickCollectAllRewards}
+                    disabled={!hasClaimableRewards}
+                  >
+                    {t("clPositions.collectAllRewards")}
+                  </Button>
+
+                  <Button
+                    variant="outline"
+                    className="subtitle1 w-fit"
+                    onClick={() => {
+                      setActiveModal("add-liquidity");
+                    }}
+                  >
+                    {t("clPositions.createAPosition")}
+                  </Button>
+                </div>
+              </div>
+              {!userHasPositionInPool && isUserPositionsFetched && (
+                <>
+                  <SuperchargePool
+                    title={t("createFirstPositionCta.title")}
+                    caption={t("createFirstPositionCta.caption")}
+                    primaryCta={t("createFirstPositionCta.primaryCta")}
+                    secondaryCta={t("createFirstPositionCta.secondaryCta")}
+                    onCtaClick={() => {
+                      setActiveModal("add-liquidity");
+                    }}
+                    onSecondaryClick={() => {
+                      setActiveModal("learn-more");
+                    }}
+                    className="bg-osmoverse-900"
+                  />
+                  <ConcentratedLiquidityLearnMoreModal
+                    isOpen={activeModal === "learn-more"}
+                    onRequestClose={() => setActiveModal(null)}
+                  />
+                </>
+              )}
+              <MyPositionsSection forPoolId={poolId} />
+            </div>
+          )}
+        </section>
+      </main>
+    );
+  });
+
+const PoolDataGroup: FunctionComponent<{
+  label: string;
+  value: string;
+  className?: string;
+}> = ({ label, value, className }) => (
+  <div className={classNames("flex flex-col gap-2", className)}>
+    <div className="text-body2 font-body2 text-osmoverse-400">{label}</div>
+    <h4 className="text-osmoverse-100">{value}</h4>
+  </div>
+);
+
+/**
+ * Create a nested component to prevent unnecessary re-rendering whenever the hover price changes.
+ */
+const ChartHeader: FunctionComponent<{
+  config: HistoricalAndLiquidityData;
+}> = ({ config }) => {
+  const {
+    historicalRange,
+    priceDecimal,
+    setHistoricalRange,
+    baseDenom,
+    quoteDenom,
+  } = config;
+  const hoverPrice = useHoverPrice(config);
+
+  const formatOpts = useMemo(
+    () => getPriceExtendedFormatOptions(new Dec(hoverPrice)),
+    [hoverPrice]
+  );
+
+  return (
+    <PriceChartHeader
+      formatOpts={formatOpts}
+      historicalRange={historicalRange}
+      setHistoricalRange={setHistoricalRange}
+      baseDenom={baseDenom}
+      quoteDenom={quoteDenom}
+      hoverPrice={hoverPrice}
+      decimal={priceDecimal}
+      classes={{
+        buttons: "sm:hidden",
+        pricesHeaderContainerClass: "sm:flex-col",
+      }}
+    />
+  );
+};
+
+/**
+ * Create a nested component to prevent unnecessary re-rendering whenever the hover price changes.
+ */
+const Chart: FunctionComponent<{
+  config: HistoricalAndLiquidityData;
+}> = ({ config }) => {
+  const {
+    historicalChartData,
+    yRange,
+    setHoverPrice,
+    lastChartData,
+    currentPrice,
+  } = config;
+
+  return (
+    <HistoricalPriceChart
+      data={historicalChartData}
+      annotations={[]}
+      domain={yRange}
+      onPointerHover={setHoverPrice}
+      onPointerOut={() => {
+        if (lastChartData) {
+          setHoverPrice(Number(currentPrice.toString()));
+        }
+      }}
+    />
+  );
+};
+
+const UserAssetsAndExternalIncentives: FunctionComponent<{
+  poolId: string;
+  onIncentivize: () => void;
+}> = ({ poolId, onIncentivize }) => {
+  const { t } = useTranslation();
+  const featureFlags = useFeatureFlags();
+  const { isLoading: isWalletLoading } = useWalletSelect();
+  const { address } = useWallet();
+
+  const { data: poolGaugeIncentives } =
+    api.edge.pools.getPoolGaugeIncentives.useQuery({ poolId });
+
+  const hasIncentives = Boolean(poolGaugeIncentives);
+
+  const { data: userPositions } =
+    api.local.concentratedLiquidity.getUserPositions.useQuery(
+      {
+        userOsmoAddress: address ?? "",
+        forPoolId: poolId,
+      },
+      {
+        enabled: !isWalletLoading && Boolean(address),
+      }
+    );
+
+  const userPoolAssets = useMemo(() => {
+    const coinSums = new Map<string, CoinPretty>();
+    userPositions?.forEach(({ currentCoins }) => {
+      currentCoins.forEach((asset) => {
+        const existing = coinSums.get(asset.currency.coinMinimalDenom);
+        coinSums.set(
+          asset.currency.coinMinimalDenom,
+          existing ? existing.add(asset) : asset
+        );
+      });
+    });
+    return Array.from(coinSums.values());
+  }, [userPositions]);
+  // undefined (unknown) when any position's value is unknown
+  const userPoolValue = useMemo(
+    () =>
+      (userPositions ?? []).reduce<PricePretty | undefined>(
+        (sum, { currentValue }) =>
+          sum && currentValue ? sum.add(currentValue) : undefined,
+        new PricePretty(DEFAULT_VS_CURRENCY, 0)
+      ),
+    [userPositions]
+  );
+  const numUserPositions = userPositions?.length ?? 0;
+
+  const { data: incentives, isLoading: isLoadingIncentives } =
+    api.edge.pools.getPoolIncentives.useQuery(
+      {
+        poolId,
+      },
+      {
+        enabled: featureFlags.aprBreakdown,
+      }
+    );
+
+  return (
+    <div className="flex flex-wrap gap-4">
+      <div className="flex shrink-0 items-center gap-8 rounded-3xl px-8 py-7">
+        <div className="flex h-full flex-col place-content-between">
+          <span className="body2 text-osmoverse-300">
+            {t("clPositions.totalBalance")}
+          </span>
+          <div>
+            <h4 className="text-osmoverse-100">
+              {userPoolValue?.toString() ?? "–"}
+            </h4>
+            <span className="subtitle1 text-osmoverse-300">
+              {numUserPositions === 1
+                ? t("clPositions.onePosition")
+                : t("clPositions.numPositions", {
+                    numPositions: numUserPositions.toString(),
+                  })}
+            </span>
+          </div>
+        </div>
+        <div className="flex flex-col gap-5">
+          {userPoolAssets.map((asset) => (
+            <div
+              className="subtitle1 flex gap-2"
+              key={asset.currency.coinMinimalDenom}
+            >
+              {asset.currency.coinImageUrl && (
+                <div className="h-5 w-5 shrink-0 overflow-hidden rounded-full">
+                  <EntityImage
+                    logoURIs={{
+                      svg: asset.currency.coinImageUrl?.replace(
+                        /\.png$/,
+                        ".svg"
+                      ),
+                      png: asset.currency.coinImageUrl,
+                    }}
+                    width={20}
+                    height={20}
+                    name={asset.currency.coinDenom}
+                    symbol={asset.currency.coinDenom}
+                  />
+                </div>
+              )}
+              <span className="text-osmoverse-300">
+                {asset.currency.coinDenom}
+              </span>
+              <span className="text-osmoverse-100">
+                {formatPretty(asset, { maxDecimals: 2 })}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+      {/* Incentivize entry sits to the right of the Total APR card, filling
+          the dead space beside it. Gated on its own incentivizePool flag, not
+          on aprBreakdown, so the two can be toggled independently. */}
+      <div className="flex shrink-0 items-center gap-4">
+        {featureFlags.aprBreakdown && (
+          <SkeletonLoader isLoaded={!isLoadingIncentives}>
+            <AprBreakdown
+              className="shrink-0 rounded-3xl"
+              showDisclaimerTooltip
+              {...incentives?.aprBreakdown}
+            />
+          </SkeletonLoader>
+        )}
+        {featureFlags.incentivizePool && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="w-fit"
+            onClick={onIncentivize}
+          >
+            {t("incentivizePool.entry")}
+          </Button>
+        )}
+      </div>
+
+      {hasIncentives && (
+        <div className="flex h-full w-full flex-col place-content-between items-center rounded-3xl px-8 py-7">
+          <span className="body2 mr-auto text-osmoverse-300">
+            {t("pool.incentives")}
+          </span>
+          <div className="flex w-full items-center">
+            {poolGaugeIncentives && (
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1">
+                  <div className="h-5 w-5 shrink-0 overflow-hidden rounded-full">
+                    <EntityImage
+                      logoURIs={{
+                        png: poolGaugeIncentives.coinPerDay.currency
+                          .coinImageUrl,
+                      }}
+                      name={poolGaugeIncentives.coinPerDay.currency.coinDenom}
+                      symbol={poolGaugeIncentives.coinPerDay.currency.coinDenom}
+                      width={20}
+                      height={20}
+                    />
+                  </div>
+                </div>
+                <div className="subtitle1 flex flex-col gap-1 text-osmoverse-300">
+                  <span>
+                    {t("pool.dailyEarnAmount", {
+                      amount: formatPretty(poolGaugeIncentives.coinPerDay, {
+                        maxDecimals: 2,
+                      }),
+                    })}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+          <span className="caption mr-auto text-osmoverse-500">
+            *{t("pool.onlyInRangePositions")}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+};

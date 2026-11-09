@@ -1,0 +1,435 @@
+import {
+  Checkbox,
+  Field,
+  Label,
+  Listbox,
+  ListboxButton,
+  ListboxOption,
+  ListboxOptions,
+  Transition,
+} from "@headlessui/react";
+import { prepareCreateConcentratedPoolMsg } from "@osmosis-labs/tx";
+import { Dec, RatePretty } from "@osmosis-labs/unit";
+import React, { Fragment, memo, useMemo, useState } from "react";
+
+import { Icon } from "~/components/assets/icon";
+import { SelectionToken } from "~/components/complex/pool/create/cl-pool";
+import { DuplicatePoolCallout } from "~/components/complex/pool/create/duplicate-pool-callout";
+import { SkeletonLoader, Spinner } from "~/components/loaders";
+import { Button } from "~/components/ui/button";
+import { EntityImage } from "~/components/ui/entity-image";
+import { CL_POOL_CREATION_TICK_SPACING } from "~/config";
+import { useDisclosure, useFilteredData, useTranslation } from "~/hooks";
+import type { CreatePoolConfig } from "~/hooks/ui-config/use-create-pool-config";
+import {
+  useDuplicateGate,
+  useDuplicatePoolCheck,
+} from "~/hooks/use-duplicate-pool-check";
+import { useShowPreviewAssets } from "~/hooks/use-show-preview-assets";
+import { useWallet } from "~/hooks/use-wallet";
+import { TokenSelectModal } from "~/modals";
+import { useUserSettingsStore } from "~/stores/user-settings-store";
+import { formatPretty } from "~/utils/formatter";
+import { getLogoURIs } from "~/utils/logo-uri";
+import { api } from "~/utils/trpc";
+
+interface SetBaseInfosProps {
+  config: CreatePoolConfig;
+  advanceStep?: () => void;
+  selectedBase?: SelectionToken;
+  selectedQuote: SelectionToken;
+  setSelectedBase: (value: SelectionToken) => void;
+  setSelectedQuote: (value: SelectionToken) => void;
+  setPoolId: (value: string) => void;
+  onUseExistingPool?: (poolId: string) => void;
+}
+
+export const SetBaseInfos = memo(
+  ({
+    config,
+    advanceStep,
+    selectedBase,
+    selectedQuote,
+    setSelectedBase,
+    setSelectedQuote,
+    setPoolId,
+    onUseExistingPool,
+  }: SetBaseInfosProps) => {
+    const { t } = useTranslation();
+
+    const showUnverifiedAssets = useUserSettingsStore(
+      (state) => state.showUnverifiedAssets
+    );
+
+    const { signAndBroadcast, transactionContext } = useWallet();
+    const { showPreviewAssets } = useShowPreviewAssets();
+
+    const { data: tokens, isLoading: isLoadingTokens } =
+      api.local.concentratedLiquidity.getTokens.useQuery({
+        includePreview: showPreviewAssets,
+        onlyVerified: showUnverifiedAssets === false,
+      });
+
+    const quoteTokens = useMemo(() => {
+      return tokens
+        ?.filter(
+          ({ token }) => token.coinDenom !== selectedQuote?.token.coinDenom
+        )
+        .sort((a, b) => {
+          if (a.token.coinDenom === "BTC" || b.token.coinDenom === "BTC")
+            return -1;
+
+          return 1;
+        });
+    }, [tokens, selectedQuote]);
+
+    const { data: clParams } =
+      api.local.concentratedLiquidity.getClParams.useQuery();
+
+    const [selectedSpread, setSelectedSpread] = useState(
+      "0.000000000000000000"
+    );
+
+    const [isAgreementChecked, setIsAgreementChecked] = useState(false);
+    const [isTxLoading, setIsTxLoading] = useState(false);
+
+    const baseDenom = selectedBase?.token.coinMinimalDenom;
+    const quoteDenom = selectedQuote?.token.coinMinimalDenom;
+    const duplicateProposed = useMemo(() => {
+      if (!baseDenom || !quoteDenom) return null;
+      return {
+        kind: "concentrated" as const,
+        denom0: baseDenom,
+        denom1: quoteDenom,
+        spreadFactor: selectedSpread,
+        tickSpacing: CL_POOL_CREATION_TICK_SPACING,
+      };
+    }, [baseDenom, quoteDenom, selectedSpread]);
+    const duplicateCheck = useDuplicatePoolCheck({
+      proposed: duplicateProposed,
+      enabled: Boolean(baseDenom && quoteDenom),
+    });
+    useDuplicateGate({
+      setDuplicateBlocking: config.setDuplicateBlocking,
+      setDuplicateAcknowledged: config.setDuplicateAcknowledged,
+      status: duplicateCheck.status,
+      exactMatches: duplicateCheck.exactMatches,
+      proposed: duplicateProposed,
+    });
+
+    const is18DecimalBase =
+      selectedBase?.token.coinDecimals === 18 &&
+      selectedQuote?.token.coinDecimals === 6;
+
+    const { data: basePrice, isLoading: isBasePriceLoading } =
+      api.edge.assets.getAssetPrice.useQuery(
+        { coinMinimalDenom: selectedBase?.token.coinMinimalDenom ?? "" },
+        { enabled: is18DecimalBase && !!selectedBase?.token.coinMinimalDenom }
+      );
+    const { data: quotePrice, isLoading: isQuotePriceLoading } =
+      api.edge.assets.getAssetPrice.useQuery(
+        { coinMinimalDenom: selectedQuote?.token.coinMinimalDenom ?? "" },
+        { enabled: is18DecimalBase && !!selectedQuote?.token.coinMinimalDenom }
+      );
+
+    // Block 18-decimal base paired with 6-decimal quote unless price is known
+    // and base is worth at least 100x the quote asset. No price = blocked.
+    const is18DecimalMismatch =
+      is18DecimalBase &&
+      (isBasePriceLoading ||
+        isQuotePriceLoading ||
+        basePrice === undefined ||
+        quotePrice === undefined ||
+        quotePrice.toDec().isZero() ||
+        basePrice.toDec().quo(quotePrice.toDec()).lt(new Dec(100)));
+
+    return (
+      <>
+        <div className="flex flex-col gap-10">
+          <div className="flex items-center justify-center gap-13">
+            <div className="flex flex-col gap-2 pl-4">
+              <span className="subtitle1 text-white">
+                {t("pools.createSupercharged.base")}
+              </span>
+              {tokens ? (
+                <TokenSelector
+                  assets={tokens.filter(
+                    (qc) =>
+                      qc.token.coinDenom !== selectedQuote?.token.coinDenom
+                  )}
+                  selectedAsset={selectedBase}
+                  setSelectedAsset={setSelectedBase}
+                />
+              ) : (
+                <SkeletonLoader className="h-[92px] w-[260px] rounded-3xl" />
+              )}
+            </div>
+            <div className="flex flex-col gap-2 pl-4">
+              <span className="subtitle1 text-white">
+                {t("pools.createSupercharged.quote")}
+              </span>
+              {quoteTokens ? (
+                <TokenSelector
+                  assets={quoteTokens}
+                  selectedAsset={selectedQuote}
+                  setSelectedAsset={setSelectedQuote}
+                />
+              ) : (
+                <SkeletonLoader className="h-[92px] w-[260px] rounded-3xl" />
+              )}
+            </div>
+          </div>
+          <div className="flex items-center justify-center gap-5">
+            <span className="subtitle1">
+              {t("pools.createSupercharged.swapFee")}
+            </span>
+            {clParams ? (
+              <SpreadSelector
+                options={clParams.authorizedSpreadFactors}
+                value={selectedSpread}
+                onChange={setSelectedSpread}
+              />
+            ) : (
+              <div className="flex h-12 items-center justify-center">
+                <Spinner />
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex flex-col items-center justify-center gap-6">
+          {selectedBase && (
+            <div className="w-full max-w-[641px]">
+              <DuplicatePoolCallout
+                status={duplicateCheck.status}
+                exactMatches={duplicateCheck.exactMatches}
+                similarMatches={duplicateCheck.similarMatches}
+                acknowledged={config.duplicateAcknowledged}
+                onToggleAcknowledged={() =>
+                  config.setDuplicateAcknowledged(!config.duplicateAcknowledged)
+                }
+                onUseExistingPool={onUseExistingPool}
+              />
+            </div>
+          )}
+          <Field className="flex items-center gap-3">
+            <Checkbox
+              className="group flex h-[26px] w-[26px] items-center justify-center rounded-lg border-2 border-solid border-osmoverse-400 transition-colors data-[checked]:bg-osmoverse-400"
+              checked={isAgreementChecked}
+              onChange={setIsAgreementChecked}
+            >
+              <svg
+                width="15"
+                height="12"
+                viewBox="0 0 15 12"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+                className="opacity-0 transition-opacity group-data-[checked]:opacity-100"
+              >
+                <path
+                  d="M1.5 6L4.80769 9.5L13 2"
+                  stroke="#231D4B"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </Checkbox>
+            <Label className="body2">
+              {t("pools.createSupercharged.undersandCost", {
+                poolCreationFee: "20 USDC",
+              })}
+            </Label>
+          </Field>
+          {is18DecimalMismatch && (
+            <div className="body2 text-center text-rust-400">
+              <p>
+                {t("pools.createSupercharged.18decimalWarning", {
+                  symbol: selectedBase!.token.coinDenom,
+                })}
+              </p>
+              <p className="mt-1">
+                {t("pools.createSupercharged.18decimalWarningAction")}
+              </p>
+            </div>
+          )}
+          <Button
+            disabled={
+              !isAgreementChecked ||
+              !selectedBase ||
+              is18DecimalMismatch ||
+              (config.duplicateBlocking && !config.duplicateAcknowledged)
+            }
+            isLoading={isLoadingTokens || isTxLoading}
+            onClick={() => {
+              setIsTxLoading(true);
+              prepareCreateConcentratedPoolMsg(
+                transactionContext,
+                selectedBase?.token.coinMinimalDenom!,
+                selectedQuote?.token.coinMinimalDenom!,
+                CL_POOL_CREATION_TICK_SPACING,
+                +selectedSpread,
+                undefined,
+                (res) => {
+                  if (res.code === 0) {
+                    setIsTxLoading(false);
+                    if (!res.events) return;
+
+                    const poolId = res.events
+                      .find(({ type }) => type === "pool_created")
+                      ?.attributes.find(({ key }) => key === "pool_id")?.value;
+
+                    if (!poolId) return;
+
+                    setPoolId(poolId);
+                    advanceStep?.();
+                  }
+                }
+              )
+                .then((prepared) => signAndBroadcast(...prepared))
+                .finally(() => setIsTxLoading(false));
+            }}
+          >
+            {isTxLoading
+              ? t("pools.createSupercharged.buttonCreating")
+              : t("pools.createSupercharged.buttonCreate")}
+          </Button>
+        </div>
+      </>
+    );
+  }
+);
+
+export interface TokenSelectorProps {
+  assets: SelectionToken[];
+  setSelectedAsset: (asset: SelectionToken) => void;
+  selectedAsset?: SelectionToken;
+}
+
+const TokenSelector = ({
+  selectedAsset,
+  assets,
+  setSelectedAsset,
+}: TokenSelectorProps) => {
+  const { t } = useTranslation();
+  const { isOpen, onClose, onOpen } = useDisclosure();
+
+  const [query, setQuery, results] = useFilteredData(assets, [
+    "token.coinDenom",
+  ]);
+
+  return (
+    <>
+      <button
+        onClick={onOpen}
+        className="flex w-[260px] items-center justify-between rounded-3xl bg-osmoverse-825 p-5"
+      >
+        <div className="flex items-center gap-3">
+          {selectedAsset ? (
+            <>
+              <EntityImage
+                logoURIs={getLogoURIs(selectedAsset.token.coinImageUrl)}
+                name={selectedAsset.token.coinDenom}
+                symbol={selectedAsset.token.coinDenom}
+                width={52}
+                height={52}
+                className="overflow-hidden rounded-full"
+              />
+              <h5 className="max-w-[130px] truncate">
+                {selectedAsset.token.coinDenom}
+              </h5>
+            </>
+          ) : (
+            <>
+              <div className="flex h-13 w-13 items-center justify-center rounded-full bg-wosmongton-400">
+                <Icon id="close-button-icon" className="rotate-45" />
+              </div>
+              <h6>{t("pools.createSupercharged.buttonAddToken")}</h6>
+            </>
+          )}
+        </div>
+        {selectedAsset && (
+          <div className="flex h-6 w-6 items-center justify-center">
+            <Icon
+              id="chevron-left"
+              width={12}
+              height={24}
+              className="-rotate-90 text-osmoverse-400"
+            />
+          </div>
+        )}
+      </button>
+      <TokenSelectModal
+        isOpen={isOpen}
+        tokens={results}
+        currentValue={query}
+        onInput={setQuery}
+        onRequestClose={onClose}
+        onSelect={(selectedDenom) =>
+          setSelectedAsset(
+            assets.find((value) => value.token.coinDenom === selectedDenom)!
+          )
+        }
+      />
+    </>
+  );
+};
+
+interface SpreadSelectorProps {
+  options: string[];
+  value: string;
+  onChange: (v: string) => void;
+}
+
+function SpreadSelector({ options, value, onChange }: SpreadSelectorProps) {
+  return (
+    <Listbox value={value} onChange={onChange}>
+      <div className="relative flex">
+        <ListboxButton className="flex items-center justify-center gap-2.5 rounded-xl bg-osmoverse-825 py-3 px-4">
+          <span className="max-w-[100px] truncate font-subtitle1 leading-6 sm:max-w-none">
+            {formatPretty(new RatePretty(value))}
+          </span>
+          <Icon id="caret-down" />
+        </ListboxButton>
+        <Transition
+          as={Fragment}
+          enter="transition ease-in duration-150"
+          enterFrom="opacity-0"
+          enterTo="opacity-100"
+          leave="transition ease-in duration-150"
+          leaveFrom="opacity-100"
+          leaveTo="opacity-0"
+        >
+          <ListboxOptions className="absolute inset-x-0 z-[51] mt-13 flex max-h-[200px] w-max flex-col gap-2 overflow-scroll rounded-lg bg-osmoverse-800 pt-2">
+            {options.map((option, i) => (
+              <ListboxOption
+                className="group relative inline-flex select-none items-center gap-3 py-2 px-4 data-[selected]:bg-osmoverse-850"
+                key={`${option} ${i}`}
+                value={option}
+              >
+                <div className="flex h-6 w-6 items-center justify-center rounded-lg">
+                  <svg
+                    width="15"
+                    height="12"
+                    viewBox="0 0 15 12"
+                    fill="none"
+                    xmlns="http://www.w3.org/2000/svg"
+                    className="opacity-0 transition-opacity group-data-[selected]:opacity-100"
+                  >
+                    <path
+                      d="M1.5 6L4.80769 9.5L13 2"
+                      stroke="#FFFFFF"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </div>
+                <span className="truncate capitalize">
+                  {formatPretty(new RatePretty(option))}
+                </span>
+              </ListboxOption>
+            ))}
+          </ListboxOptions>
+        </Transition>
+      </div>
+    </Listbox>
+  );
+}

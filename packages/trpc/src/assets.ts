@@ -1,0 +1,983 @@
+import {
+  AssetFilterSchema,
+  AvailableRangeValues,
+  AvailableTimeDurations,
+  captureErrorAndReturn,
+  createSortSchema,
+  CursorPaginationSchema,
+  DEFAULT_VS_CURRENCY,
+  getAsset,
+  getAssetCoingeckoCoin,
+  getAssetHistoricalPrice,
+  getAssetListingDate,
+  getAssetMarketActivity,
+  getAssetPrice,
+  getAssets,
+  getAssetWithUserBalance,
+  getAssetWithVariants,
+  getBridgeAsset,
+  getCategoryImageSamples,
+  getCoinGeckoCoinMarketChart,
+  getMarketAsset,
+  getPoolAssetPairHistoricalPrice,
+  getUpcomingAssets,
+  getUserAssetsTotal,
+  isMarketDataAvailable,
+  mapGetAssetsWithUserBalances,
+  mapGetMarketAssets,
+  maybeCachePaginatedItems,
+  sortAssetSearchResults,
+  TimeDuration,
+  TimeFrame,
+  withSqsPriceFallback,
+} from "@osmosis-labs/server";
+import { Dec, PricePretty } from "@osmosis-labs/unit";
+import { compareCommon, isNil, sort } from "@osmosis-labs/utils";
+import { TRPCError } from "@trpc/server";
+import { z } from "zod";
+
+import { createTRPCRouter, publicProcedure } from "./api";
+import { UserOsmoAddressSchema } from "./parameter-types";
+
+const GetInfiniteAssetsInputSchema =
+  CursorPaginationSchema.merge(AssetFilterSchema);
+
+/** Symbols (`coinDenom`) the user has watchlisted; ranks them up in search results. */
+const WatchListDenomsSchema = z.object({
+  watchListDenoms: z.array(z.string()).optional(),
+});
+
+export const assetsRouter = createTRPCRouter({
+  getUserAsset: publicProcedure
+    .input(
+      z
+        .object({
+          findMinDenomOrSymbol: z.string(),
+        })
+        .merge(UserOsmoAddressSchema)
+    )
+    .query(
+      async ({ input: { findMinDenomOrSymbol, userOsmoAddress }, ctx }) => {
+        const asset = getAsset({
+          ...ctx,
+          anyDenom: findMinDenomOrSymbol,
+        });
+
+        return await getAssetWithUserBalance({
+          ...ctx,
+          asset,
+          userOsmoAddress,
+        });
+      }
+    ),
+  getUserAssets: publicProcedure
+    .input(
+      GetInfiniteAssetsInputSchema.merge(UserOsmoAddressSchema)
+        .merge(
+          z.object({
+            // Optional poolId to filter assets by pool
+            poolId: z.string().optional(),
+          })
+        )
+        .merge(WatchListDenomsSchema)
+    )
+    .query(
+      async ({
+        input: {
+          search,
+          userOsmoAddress,
+          limit,
+          cursor,
+          onlyVerified,
+          includePreview,
+          categories,
+          poolId,
+          watchListDenoms,
+        },
+        ctx,
+      }) =>
+        maybeCachePaginatedItems({
+          getFreshItems: async () => {
+            const assets = await mapGetAssetsWithUserBalances({
+              ...ctx,
+              search,
+              userOsmoAddress,
+              onlyVerified,
+              sortFiatValueDirection: "desc",
+              includePreview,
+              categories,
+              poolId,
+            });
+
+            return search
+              ? sortAssetSearchResults(assets, { search, watchListDenoms })
+              : assets;
+          },
+          cacheKey: JSON.stringify({
+            search,
+            userOsmoAddress,
+            onlyVerified,
+            includePreview,
+            categories,
+            poolId,
+            // only affects ordering while searching
+            watchListDenoms: search ? watchListDenoms : undefined,
+          }),
+          cursor,
+          limit,
+        })
+    ),
+
+  getBridgeAssetWithVariants: publicProcedure
+    .input(z.object({ findMinDenomOrSymbol: z.string() }))
+    .query(async ({ input: { findMinDenomOrSymbol }, ctx }) => {
+      const canonicalAssetWithVariants = getAssetWithVariants({
+        ...ctx,
+        anyDenom: findMinDenomOrSymbol,
+      });
+
+      return canonicalAssetWithVariants;
+    }),
+  getAssetPrice: publicProcedure
+    .input(
+      z.object({
+        coinMinimalDenom: z.string(),
+      })
+    )
+    .query(async ({ input: { coinMinimalDenom }, ctx }) => {
+      const price = await getAssetPrice({
+        ...ctx,
+        asset: { coinMinimalDenom },
+      });
+
+      return new PricePretty(DEFAULT_VS_CURRENCY, price);
+    }),
+  getAssetPrices: publicProcedure
+    .input(
+      z.object({
+        coinMinimalDenoms: z.array(z.string()).max(100),
+      })
+    )
+    .query(async ({ input: { coinMinimalDenoms }, ctx }) => {
+      const uniqueDenoms = Array.from(new Set(coinMinimalDenoms));
+      // A single asset without a price must not fail the whole batch.
+      const results = await Promise.allSettled(
+        uniqueDenoms.map((coinMinimalDenom) =>
+          getAssetPrice({ ...ctx, asset: { coinMinimalDenom } })
+        )
+      );
+
+      const prices: Record<string, PricePretty> = {};
+      results.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          prices[uniqueDenoms[index]] = new PricePretty(
+            DEFAULT_VS_CURRENCY,
+            result.value
+          );
+        }
+      });
+      return prices;
+    }),
+  getAssetWithPrice: publicProcedure
+    .input(
+      z.object({
+        findMinDenomOrSymbol: z.string(),
+      })
+    )
+    .query(async ({ input: { findMinDenomOrSymbol }, ctx }) => {
+      const asset = getAsset({ ...ctx, anyDenom: findMinDenomOrSymbol });
+      const price = await getAssetPrice({
+        ...ctx,
+        asset,
+      });
+
+      return {
+        ...asset,
+        currentPrice: new PricePretty(DEFAULT_VS_CURRENCY, price),
+      };
+    }),
+  getMarketAsset: publicProcedure
+    .input(
+      z.object({
+        findMinDenomOrSymbol: z.string(),
+      })
+    )
+    .query(async ({ input: { findMinDenomOrSymbol }, ctx }) => {
+      const asset = getAsset({
+        ...ctx,
+        anyDenom: findMinDenomOrSymbol,
+      });
+
+      const userAsset = await getAssetWithUserBalance({
+        ...ctx,
+        asset,
+      });
+      const userMarketAsset = await getMarketAsset({
+        ...ctx,
+        includeTotalSupply: true,
+        asset: userAsset,
+      });
+
+      return {
+        ...userAsset,
+        ...userMarketAsset,
+      };
+    }),
+  getUserMarketAsset: publicProcedure
+    .input(
+      z
+        .object({
+          findMinDenomOrSymbol: z.string(),
+        })
+        .merge(UserOsmoAddressSchema)
+    )
+    .query(
+      async ({ input: { findMinDenomOrSymbol, userOsmoAddress }, ctx }) => {
+        const asset = getAsset({
+          ...ctx,
+          anyDenom: findMinDenomOrSymbol,
+        });
+
+        const userAsset = await getAssetWithUserBalance({
+          ...ctx,
+          asset,
+          userOsmoAddress,
+        });
+        const userMarketAsset = await getMarketAsset({
+          ...ctx,
+          asset: userAsset,
+        });
+
+        return {
+          ...userAsset,
+          ...userMarketAsset,
+        };
+      }
+    ),
+  getMarketAssets: publicProcedure
+    .input(
+      GetInfiniteAssetsInputSchema.merge(
+        z.object({
+          sort: createSortSchema([
+            "currentPrice",
+            "priceChange1h",
+            "priceChange24h",
+            "priceChange7d",
+            "marketCap",
+            "volume24h",
+          ] as const).optional(),
+          watchListDenoms: z.array(z.string()).optional(),
+          excludeVariants: z.boolean().optional(),
+          excludeStablecoins: z.boolean().optional(),
+          minLiquidity: z.number().optional(),
+          minVolume24h: z.number().optional(),
+          maxPriceChange24h: z.number().optional(),
+        })
+      )
+    )
+    .query(
+      async ({
+        input: {
+          search,
+          onlyVerified,
+          sort: sortInput,
+          watchListDenoms,
+          categories,
+          cursor,
+          limit,
+          includePreview,
+          excludeVariants,
+          excludeStablecoins,
+          minLiquidity,
+          minVolume24h,
+          maxPriceChange24h,
+        },
+        ctx,
+      }) => {
+        const page = await maybeCachePaginatedItems({
+          getFreshItems: async () => {
+            // Without market data the liquidity and volume filters drop every asset, so
+            // the list would come back empty; report an outage with its own code so the
+            // client can tell it apart from other errors. A search with no such filter
+            // doesn't depend on market data: its rows carry unknown market fields and
+            // prices fall back to SQS.
+            const dependsOnMarketData = !(
+              search &&
+              minLiquidity === 0 &&
+              minVolume24h === undefined
+            );
+            const marketDataAvailable = await isMarketDataAvailable();
+            if (dependsOnMarketData && !marketDataAvailable) {
+              throw new TRPCError({
+                code: "SERVICE_UNAVAILABLE",
+                message: "Market data is unavailable",
+              });
+            }
+
+            const marketAssets = await mapGetMarketAssets({
+              ...ctx,
+              search,
+              onlyVerified,
+              includePreview,
+              categories,
+              excludeVariants,
+              excludeStablecoins,
+              minLiquidity,
+              minVolume24h,
+              maxPriceChange24h,
+              // during an outage no row has a price; only the returned page is priced
+              sqsPriceFallback: marketDataAvailable,
+            });
+            // A search served during an outage shows no outage state, so the stale
+            // volume the data keeps is shown as unknown instead.
+            const assets = marketDataAvailable
+              ? marketAssets
+              : marketAssets.map((asset) => ({
+                  ...asset,
+                  volume24h: undefined,
+                }));
+
+            // sorting
+            if (sortInput) {
+              // user sorting
+
+              return sort(assets, sortInput.keyPath, sortInput.direction);
+            } else if (search) {
+              return sortAssetSearchResults(assets, {
+                search,
+                watchListDenoms,
+              });
+            } else {
+              // default sorting, maybe with watchlist
+
+              if (watchListDenoms) {
+                // default sort watchlist to top
+                return assets.sort((a, b) => {
+                  // 1. watchlist denoms sorted by volume 24h desc
+                  if (
+                    watchListDenoms.includes(a.coinDenom) &&
+                    watchListDenoms.includes(b.coinDenom)
+                  )
+                    return compareCommon(a.volume24h, b.volume24h);
+                  if (watchListDenoms.includes(a.coinDenom)) return -1;
+                  if (watchListDenoms.includes(b.coinDenom)) return 1;
+
+                  // 2. rest of the assets by volume 24h desc
+                  return compareCommon(a.volume24h, b.volume24h);
+                });
+              } else {
+                // default sort by volume24h desc
+                return sort(assets, "volume24h");
+              }
+            }
+          },
+          cacheKey: JSON.stringify({
+            search,
+            onlyVerified,
+            sort: sortInput,
+            watchListDenoms,
+            categories,
+            includePreview,
+            excludeVariants,
+            excludeStablecoins,
+            minLiquidity,
+            minVolume24h,
+            maxPriceChange24h,
+          }),
+          cursor,
+          limit,
+        });
+
+        if (await isMarketDataAvailable()) return page;
+        return {
+          ...page,
+          items: await Promise.all(
+            page.items.map((asset) => withSqsPriceFallback({ ...ctx, asset }))
+          ),
+        };
+      }
+    ),
+  getCoingeckoCoin: publicProcedure
+    .input(
+      z.object({
+        coinGeckoId: z.string(),
+      })
+    )
+    .query(({ input: { coinGeckoId } }) =>
+      getAssetCoingeckoCoin({ coinGeckoId })
+    ),
+  getUserBridgeAsset: publicProcedure
+    .input(
+      z
+        .object({
+          findMinDenomOrSymbol: z.string(),
+        })
+        .merge(UserOsmoAddressSchema)
+    )
+    .query(
+      async ({ input: { findMinDenomOrSymbol, userOsmoAddress }, ctx }) => {
+        const asset = getAsset({
+          ...ctx,
+          anyDenom: findMinDenomOrSymbol,
+        });
+
+        const bridgeAsset = getBridgeAsset(ctx.assetLists, asset);
+
+        return await getAssetWithUserBalance({
+          ...ctx,
+          asset: bridgeAsset,
+          userOsmoAddress,
+        });
+      }
+    ),
+  getUserBridgeAssets: publicProcedure
+    .input(
+      GetInfiniteAssetsInputSchema.merge(UserOsmoAddressSchema)
+        .merge(
+          z.object({
+            sort: createSortSchema([
+              "currentPrice",
+              "priceChange24h",
+              "usdValue",
+            ] as const).optional(),
+          })
+        )
+        .merge(WatchListDenomsSchema)
+    )
+    .query(
+      ({
+        input: {
+          search,
+          onlyVerified,
+          userOsmoAddress,
+          sort: sortInput,
+          categories,
+          cursor,
+          limit,
+          includePreview,
+          watchListDenoms,
+        },
+        ctx,
+      }) => {
+        const getUserAssets = async () => {
+          const assets = await mapGetAssetsWithUserBalances({
+            ...ctx,
+            search,
+            categories,
+            userOsmoAddress,
+            includePreview,
+          });
+
+          if (search) return assets;
+          return assets.filter((asset) => asset.amount?.toDec().isPositive());
+        };
+
+        const withPrices = (
+          assets: Awaited<ReturnType<typeof getUserAssets>>
+        ) =>
+          Promise.all(
+            assets.map(async (asset) => {
+              const [currentPrice, priceChange24h] = await Promise.all([
+                getAssetPrice({ ...ctx, asset })
+                  .then((price) => new PricePretty(DEFAULT_VS_CURRENCY, price))
+                  .catch((e) => captureErrorAndReturn(e, undefined)),
+                // Unavailable market data leaves the change unknown instead of
+                // failing the user's balances.
+                getAssetMarketActivity(asset)
+                  .then((activity) => activity?.price24hChange)
+                  .catch((e) => captureErrorAndReturn(e, undefined)),
+              ]);
+
+              return getBridgeAsset(ctx.assetLists, {
+                ...asset,
+                currentPrice,
+                priceChange24h,
+              });
+            })
+          );
+
+        const cacheKey = JSON.stringify({
+          search,
+          onlyVerified,
+          userOsmoAddress,
+          sort: sortInput,
+          categories,
+          includePreview,
+          // only affects ordering while searching without a column sort
+          watchListDenoms: search && !sortInput ? watchListDenoms : undefined,
+        });
+
+        // Sorting by a price field needs every row priced first.
+        if (
+          sortInput?.keyPath === "currentPrice" ||
+          sortInput?.keyPath === "priceChange24h"
+        ) {
+          return maybeCachePaginatedItems({
+            getFreshItems: async () =>
+              sort(
+                await withPrices(await getUserAssets()),
+                sortInput.keyPath,
+                sortInput.direction
+              ),
+            cacheKey,
+            cursor,
+            limit,
+          });
+        }
+
+        // Otherwise price only the returned page. A search matches every
+        // listed asset, held or not (a one-letter query matches hundreds),
+        // and pricing them all at once floods SQS with parallel requests.
+        return maybeCachePaginatedItems({
+          getFreshItems: async () => {
+            const assets = await getUserAssets();
+            if (sortInput)
+              return sort(assets, sortInput.keyPath, sortInput.direction);
+            return search
+              ? sortAssetSearchResults(assets, { search, watchListDenoms })
+              : assets;
+          },
+          cacheKey,
+          cursor,
+          limit,
+        }).then(async ({ items, nextCursor }) => ({
+          items: await withPrices(items),
+          nextCursor,
+        }));
+      }
+    ),
+  getUserAssetsTotal: publicProcedure
+    .input(UserOsmoAddressSchema.required())
+    .query(({ input, ctx }) => getUserAssetsTotal({ ...ctx, ...input })),
+  getAssetHistoricalPrice: publicProcedure
+    .input(
+      z.object({
+        coinMinimalDenom: z.string(),
+        timeFrame: z.union([
+          z.object({
+            custom: z.object({
+              timeFrame: z
+                .number()
+                .refine((tf) => AvailableRangeValues.includes(tf as TimeFrame)),
+              numRecentFrames: z.number().optional(),
+            }),
+          }),
+          z.enum(["1H", "1D", "1W", "1M"]),
+        ]),
+        realtime: z.boolean().optional(),
+      })
+    )
+    .query(({ input: { coinMinimalDenom, timeFrame, realtime } }) => {
+      // An empty chart lets the asset page fall back to CoinGecko history. Realtime
+      // callers (the TradingView feed) get the error instead, so it isn't shown as "no data".
+      const onError = (e: Error) =>
+        realtime ? Promise.reject(e) : captureErrorAndReturn(e, []);
+
+      if (typeof timeFrame === "string") {
+        return getAssetHistoricalPrice({
+          coinMinimalDenom,
+          timeFrame,
+          realtime,
+        }).catch(onError);
+      } else {
+        return getAssetHistoricalPrice({
+          coinMinimalDenom,
+          timeFrame: timeFrame.custom.timeFrame as TimeFrame,
+          numRecentFrames: timeFrame.custom.numRecentFrames,
+          realtime,
+        }).catch(onError);
+      }
+    }),
+  /**
+   * Returns the single most recent historical price point at the finest
+   * available bucket that still has data. Used to render a timeframe-
+   * independent "last update" value (e.g. for a stale-data indicator)
+   * without re-keying off whichever range the chart happens to be
+   * displaying.
+   *
+   * Cascades fine -> coarse so assets that have gone quiet (no recent
+   * swaps) still return a point. The upstream historical-bar API only
+   * surfaces buckets it has data for; a 20-day-stale asset has no 5-min
+   * bar in the recent window but does have a 1-day bar covering the day
+   * of its last swap. Three queries in the worst case; one in the
+   * common case.
+   */
+  getAssetLatestPricePoint: publicProcedure
+    .input(
+      z.object({
+        coinMinimalDenom: z.string(),
+        realtime: z.boolean().optional(),
+      })
+    )
+    .query(async ({ input: { coinMinimalDenom, realtime } }) => {
+      const tryAtTimeFrame = (timeFrame: 5 | 60 | 1440) =>
+        getAssetHistoricalPrice({
+          coinMinimalDenom,
+          timeFrame,
+          // realtime only meaningful for the 5-min bucket; on coarser
+          // buckets it would shrink the cache TTL from 3min to 3s for
+          // no benefit (the upstream day-bar isn't realtime anyway).
+          realtime: timeFrame === 5 ? realtime : false,
+        })
+          .then((points) => points[points.length - 1] ?? null)
+          .catch((e) => captureErrorAndReturn(e, null));
+
+      const fivemin = await tryAtTimeFrame(5);
+      if (fivemin) return fivemin;
+      const hourly = await tryAtTimeFrame(60);
+      if (hourly) return hourly;
+      return await tryAtTimeFrame(1440);
+    }),
+  getCoingeckoAssetHistoricalPrice: publicProcedure
+    .input(
+      z.object({
+        /**
+         * Coingecko ID
+         */
+        id: z.string(),
+        timeFrame: z.union([
+          z.object({
+            custom: z.object({
+              from: z.number().int().min(0),
+              to: z.number().int().min(0),
+            }),
+          }),
+          z.enum(["1h", "1d", "7d", "1mo", "1y", "all"]),
+        ]),
+      })
+    )
+    .query(({ input: { id, timeFrame } }) =>
+      getCoinGeckoCoinMarketChart({
+        id,
+        timeFrame: typeof timeFrame === "string" ? timeFrame : timeFrame.custom,
+      })
+    ),
+  getAssetPairHistoricalPrice: publicProcedure
+    .input(
+      z.object({
+        poolId: z.string(),
+        quoteCoinMinimalDenom: z.string(),
+        baseCoinMinimalDenom: z.string(),
+        timeDuration: z
+          .string()
+          .refine((td) => AvailableTimeDurations.includes(td as TimeDuration)),
+      })
+    )
+    .query(
+      ({
+        input: {
+          poolId,
+          quoteCoinMinimalDenom,
+          baseCoinMinimalDenom,
+          timeDuration,
+        },
+      }) =>
+        getPoolAssetPairHistoricalPrice({
+          poolId,
+          quoteCoinMinimalDenom,
+          baseCoinMinimalDenom,
+          timeDuration: timeDuration as TimeDuration,
+        }).catch((e) =>
+          // Same shape as an empty result: 0/0 would read as a real price range
+          // and seed the add-liquidity "moderate" range with it.
+          captureErrorAndReturn(e, {
+            prices: [],
+            min: Infinity,
+            max: -Infinity,
+          })
+        )
+    ),
+  getTopNewAssets: publicProcedure
+    .input(
+      z.object({
+        topN: z.number().int().positive().default(3),
+      })
+    )
+    .query(async ({ input: { topN }, ctx }) => {
+      const assets = getAssets({
+        ...ctx,
+        onlyVerified: true,
+        categories: ["new"],
+      });
+
+      // Exclude alloy variants (keep only canonical assets), so a newly listed
+      // constituent doesn't show alongside the alloy it backs.
+      const canonicalAssets = assets.filter(
+        (asset) =>
+          !asset.variantGroupKey ||
+          asset.variantGroupKey === asset.coinMinimalDenom
+      );
+
+      const marketAssets = await Promise.all(
+        canonicalAssets.map(async (asset) => {
+          const marketAsset = await getAssetMarketActivity(asset).catch((e) =>
+            captureErrorAndReturn(e, undefined)
+          );
+
+          const listingDate = getAssetListingDate({
+            assetLists: ctx.assetLists,
+            coinMinimalDenom: asset.coinMinimalDenom,
+          });
+
+          return {
+            ...asset,
+            listingDate,
+            priceChange24h: marketAsset?.price24hChange,
+          };
+        })
+      );
+
+      return sort(
+        // `sort` keeps rows without a listing date (last); this list excludes them.
+        marketAssets.filter(
+          (asset) =>
+            asset.priceChange24h !== undefined &&
+            asset.listingDate !== undefined
+        ),
+        "listingDate"
+      ).slice(0, topN);
+    }),
+  getCategorySamples: publicProcedure.query(({ ctx }) =>
+    getCategoryImageSamples(ctx)
+  ),
+  getTopGainerAssets: publicProcedure
+    .input(
+      z.object({
+        topN: z.number().int().positive().default(3),
+      })
+    )
+    .query(async ({ input: { topN }, ctx }) => {
+      // Use getAssets to get only verified assets (optimized)
+      const assets = getAssets({
+        ...ctx,
+        onlyVerified: true,
+      });
+
+      // Get full asset list to check categories and variant info
+      const fullAssetMap = new Map(
+        ctx.assetLists
+          .flatMap(({ assets }) => assets)
+          .map((asset) => [asset.coinMinimalDenom, asset])
+      );
+
+      // Filter out stablecoins and alloy variants
+      const filteredAssets = assets.filter((asset) => {
+        const fullAsset = fullAssetMap.get(asset.coinMinimalDenom);
+        if (!fullAsset) return false;
+
+        // Exclude stablecoins
+        if (fullAsset.categories?.includes("stablecoin")) return false;
+
+        // Exclude alloy variants (keep only canonical assets)
+        if (
+          asset.variantGroupKey &&
+          asset.variantGroupKey !== asset.coinMinimalDenom
+        ) {
+          return false;
+        }
+
+        return true;
+      });
+
+      const marketAssets = await Promise.all(
+        filteredAssets.map(async (asset) => {
+          const marketAsset = await getAssetMarketActivity(asset).catch((e) =>
+            captureErrorAndReturn(e, undefined)
+          );
+
+          return {
+            ...asset,
+            priceChange24h: marketAsset?.price24hChange,
+            liquidity: marketAsset?.liquidity,
+            volume24h: marketAsset?.volume24h,
+          };
+        })
+      );
+
+      // Quality floors: $5k liquidity, $1k 24h volume, and reject implausible
+      // price changes (>1000%) that usually indicate stale data or a price
+      // blip in a shallow pool rather than a real move.
+      const qualifyingAssets = marketAssets.filter((asset) => {
+        if (asset.priceChange24h === undefined) return false;
+        // RatePretty stores rates as fractions (50% => 0.5), so 1000% => 10.
+        if (asset.priceChange24h.toDec().gt(new Dec(10))) return false;
+
+        const liquidityDec = asset.liquidity?.toDec();
+        if (!liquidityDec || !liquidityDec.gte(new Dec(5000))) return false;
+
+        const volumeDec = asset.volume24h?.toDec();
+        if (!volumeDec || !volumeDec.gte(new Dec(1000))) return false;
+
+        return true;
+      });
+
+      return sort(qualifyingAssets, "priceChange24h").slice(0, topN);
+    }),
+  getTopUpcomingAssets: publicProcedure
+    .input(
+      z.object({
+        topN: z.number().int().positive().default(3),
+      })
+    )
+    .query(({ input: { topN } }) =>
+      getUpcomingAssets().then((upcomingAssets) =>
+        upcomingAssets.slice(0, topN)
+      )
+    ),
+  getImmersiveBridgeAssets: publicProcedure
+    .input(
+      GetInfiniteAssetsInputSchema.omit({
+        categories: true,
+        onlyVerified: true,
+      })
+        .merge(UserOsmoAddressSchema)
+        .merge(
+          z.object({
+            variantsNotToBeExcluded: z.array(z.string()),
+            prioritizedDenoms: z.array(z.string()),
+            deprioritizedDenoms: z.array(z.string()),
+            type: z.union([z.literal("deposit"), z.literal("withdraw")]),
+          })
+        )
+        .merge(WatchListDenomsSchema)
+    )
+    .query(
+      ({
+        input: {
+          search,
+          userOsmoAddress,
+          limit,
+          cursor,
+          includePreview,
+          variantsNotToBeExcluded,
+          prioritizedDenoms,
+          deprioritizedDenoms,
+          type,
+          watchListDenoms,
+        },
+        ctx,
+      }) =>
+        maybeCachePaginatedItems({
+          getFreshItems: async () => {
+            let assets = await mapGetAssetsWithUserBalances({
+              ...ctx,
+              search,
+              // Only get balances for withdraw
+              userOsmoAddress:
+                type === "withdraw" ? userOsmoAddress : undefined,
+              sortFiatValueDirection: "desc",
+              includePreview,
+            });
+
+            if (type === "withdraw") {
+              const hasBalance = assets.some((asset) =>
+                asset.amount?.toDec().isPositive()
+              );
+
+              assets = hasBalance
+                ? assets
+                    // Filter out all assets without amount
+                    .filter((asset) => !isNil(asset.amount))
+                : assets; // display all assets if no balance
+            } else {
+              // deposit
+
+              assets = assets
+                // Filter out all asset variants to encourage users to deposit and convert to the canonical asset
+                .filter((asset) => {
+                  if (
+                    !isNil(asset.variantGroupKey) &&
+                    !variantsNotToBeExcluded.includes(
+                      asset.coinDenom as (typeof variantsNotToBeExcluded)[number]
+                    )
+                  ) {
+                    return asset.variantGroupKey === asset.coinMinimalDenom;
+                  }
+
+                  return true;
+                });
+            }
+
+            let marketAssets = await Promise.all(
+              assets.map((asset) =>
+                getAssetMarketActivity(asset)
+                  .catch((e) => captureErrorAndReturn(e, undefined))
+                  .then((marketAsset) => ({
+                    ...asset,
+                    volume24h: marketAsset ? marketAsset.volume24h : 0,
+                    liquidity: marketAsset?.liquidity ?? 0,
+                  }))
+              )
+            );
+
+            // rank search results the same way as other asset searches
+            if (search)
+              return sortAssetSearchResults(
+                marketAssets.filter(
+                  ({ liquidity, isVerified }) =>
+                    (liquidity instanceof PricePretty
+                      ? liquidity.toDec().isPositive()
+                      : liquidity > 0) || isVerified
+                ),
+                { search, watchListDenoms }
+              );
+
+            // Sort by volume 24h desc
+            marketAssets = sort(marketAssets, "volume24h");
+
+            // Sort by prioritized denoms
+            return marketAssets
+              .sort((a, b) => {
+                const aIndex = prioritizedDenoms.indexOf(
+                  a.coinDenom as (typeof prioritizedDenoms)[number]
+                );
+                const bIndex = prioritizedDenoms.indexOf(
+                  b.coinDenom as (typeof prioritizedDenoms)[number]
+                );
+
+                if (aIndex === -1 && bIndex === -1) return 0; // Both not prioritized
+                if (aIndex === -1) return 1; // a is not prioritized, b is
+                if (bIndex === -1) return -1; // b is not prioritized, a is
+
+                return aIndex - bIndex; // Both are prioritized, sort by their index
+              })
+              .sort((a, b) => {
+                // Both not prioritized, check for deprioritized
+                const aDeprioritizedIndex = deprioritizedDenoms.indexOf(
+                  a.coinDenom as (typeof deprioritizedDenoms)[number]
+                );
+                const bDeprioritizedIndex = deprioritizedDenoms.indexOf(
+                  b.coinDenom as (typeof deprioritizedDenoms)[number]
+                );
+
+                if (aDeprioritizedIndex === -1 && bDeprioritizedIndex === -1)
+                  return 0; // Both not deprioritized
+                if (aDeprioritizedIndex === -1) return -1; // a is not deprioritized, b is
+                if (bDeprioritizedIndex === -1) return 1; // b is not deprioritized, a is
+
+                return aDeprioritizedIndex - bDeprioritizedIndex; // Both are deprioritized, sort by their index
+              })
+              .filter(({ liquidity, isVerified }) => {
+                return (
+                  (liquidity instanceof PricePretty
+                    ? liquidity.toDec().isPositive()
+                    : liquidity > 0) || isVerified
+                );
+              }) as typeof assets;
+          },
+          cacheKey: JSON.stringify({
+            search,
+            userOsmoAddress,
+            includePreview,
+            variantsToBeExcluded: variantsNotToBeExcluded,
+            prioritizedDenoms,
+            deprioritizedDenoms,
+            type,
+            // only affects ordering while searching
+            watchListDenoms: search ? watchListDenoms : undefined,
+          }),
+          cursor,
+          limit,
+        })
+    ),
+});

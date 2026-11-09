@@ -1,0 +1,360 @@
+import { tickToPrice } from "@osmosis-labs/math";
+import {
+  captureErrorAndReturn,
+  CursorPaginationSchema,
+  getOrderbookActiveOrders,
+  getOrderbookActiveOrdersSQS,
+  getOrderbookHistoricalOrders,
+  getOrderbookMakerFee,
+  getOrderbookPools,
+  getOrderbookPoolsFresh,
+  getOrderbookState,
+  IS_TESTNET,
+  MappedLimitOrder,
+  maybeCachePaginatedItems,
+  OrderStatus,
+  queryTx,
+} from "@osmosis-labs/server";
+import { Dec, Int } from "@osmosis-labs/unit";
+import { getAssetFromAssetList } from "@osmosis-labs/utils";
+import { z } from "zod";
+
+import { createTRPCRouter, publicProcedure } from "./api";
+import { OsmoAddressSchema, UserOsmoAddressSchema } from "./parameter-types";
+
+const GetInfiniteLimitOrdersInputSchema = CursorPaginationSchema.merge(
+  UserOsmoAddressSchema.required()
+).merge(
+  z.object({
+    filter: z.enum(["open", "filled", "historical", "active"]).optional(),
+  })
+);
+
+const orderStatusOrder: Record<OrderStatus, number> = {
+  filled: 0,
+  open: 1,
+  partiallyFilled: 1,
+  fullyClaimed: 2,
+  cancelled: 2,
+};
+
+function defaultSortOrders(
+  orderA: MappedLimitOrder,
+  orderB: MappedLimitOrder
+): number {
+  if (orderA.status === orderB.status) {
+    return orderB.placed_at - orderA.placed_at;
+  }
+  if (orderStatusOrder[orderA.status] < orderStatusOrder[orderB.status])
+    return -1;
+  if (orderStatusOrder[orderA.status] > orderStatusOrder[orderB.status])
+    return 1;
+
+  return orderB.placed_at - orderA.placed_at;
+}
+
+export const orderbookRouter = createTRPCRouter({
+  getMakerFee: publicProcedure
+    .input(OsmoAddressSchema.required())
+    .query(async ({ input, ctx }) => {
+      const { osmoAddress } = input;
+      const makerFee = await getOrderbookMakerFee({
+        orderbookAddress: osmoAddress,
+        chainList: ctx.chainList,
+      });
+      return {
+        makerFee,
+      };
+    }),
+  getAllOrders: publicProcedure
+    .input(GetInfiniteLimitOrdersInputSchema)
+    .query(async ({ input, ctx }) => {
+      const page = await maybeCachePaginatedItems({
+        getFreshItems: async ({ markIncomplete }) => {
+          const { userOsmoAddress } = input;
+          const pools = await getOrderbookPools();
+          const activePools = pools.filter((p) => parseInt(p.poolId) < 2065);
+          const contractAddresses = activePools.map((p) => p.contractAddress);
+
+          if (contractAddresses.length === 0 || userOsmoAddress.length === 0)
+            return [];
+          const promises = contractAddresses.map(
+            async (contractOsmoAddress: string) => {
+              const { baseDenom, quoteDenom } = pools.find(
+                (p) => p.contractAddress === contractOsmoAddress
+              )!;
+
+              const quoteAsset = getAssetFromAssetList({
+                coinMinimalDenom: quoteDenom,
+                assetLists: ctx.assetLists,
+              });
+              const baseAsset = getAssetFromAssetList({
+                coinMinimalDenom: baseDenom,
+                assetLists: ctx.assetLists,
+              });
+              const orders = await getOrderbookActiveOrders({
+                orderbookAddress: contractOsmoAddress,
+                userOsmoAddress: userOsmoAddress,
+                chainList: ctx.chainList,
+                baseAsset,
+                quoteAsset,
+              });
+              return orders;
+            }
+          );
+          // Closed orders come from the data services; their failure must not hide open orders.
+          let historicalOrdersError: Error | undefined;
+          promises.push(
+            getOrderbookHistoricalOrders({
+              userOsmoAddress: input.userOsmoAddress,
+              assetLists: ctx.assetLists,
+              chainList: ctx.chainList,
+            }).catch((e: Error) => {
+              historicalOrdersError = e;
+              return captureErrorAndReturn(e, [] as MappedLimitOrder[]);
+            })
+          );
+
+          const ordersByContracts = await Promise.all(promises);
+          const allOrders = ordersByContracts.flat();
+
+          // With no open orders to show, an empty list would read as "no orders".
+          if (historicalOrdersError && allOrders.length === 0) {
+            throw historicalOrdersError;
+          }
+          if (historicalOrdersError) {
+            // the list holds only the open orders
+            markIncomplete();
+          }
+
+          return allOrders.sort(defaultSortOrders);
+        },
+        cacheKey: `all-active-orders-${input.userOsmoAddress}`,
+        ttl: 15000,
+        cursor: input.cursor,
+        limit: input.limit,
+      });
+      return { ...page, historyUnavailable: page.incomplete === true };
+    }),
+  getAllOrdersSQS: publicProcedure
+    .input(GetInfiniteLimitOrdersInputSchema)
+    .query(async ({ input, ctx }) => {
+      const page = await maybeCachePaginatedItems({
+        getFreshItems: async ({ markIncomplete }) => {
+          const { userOsmoAddress, filter } = input;
+
+          const shouldFetchActive =
+            !filter ||
+            filter === "open" ||
+            filter === "filled" ||
+            filter === "active";
+          const shouldFetchHistorical = !filter || filter === "historical";
+          const promises: Promise<MappedLimitOrder[]>[] = [];
+          if (shouldFetchActive) {
+            promises.push(
+              getOrderbookActiveOrdersSQS({
+                userOsmoAddress,
+                assetList: ctx.assetLists,
+              })
+            );
+          }
+          // Closed orders come from the data services; their failure must not hide open orders.
+          let historicalOrdersError: Error | undefined;
+          if (shouldFetchHistorical) {
+            promises.push(
+              getOrderbookHistoricalOrders({
+                userOsmoAddress,
+                assetLists: ctx.assetLists,
+                chainList: ctx.chainList,
+              }).catch((e: Error) => {
+                historicalOrdersError = e;
+                return captureErrorAndReturn(e, [] as MappedLimitOrder[]);
+              })
+            );
+          }
+          const orders = await Promise.all(promises);
+          const allOrders = orders.flat().sort(defaultSortOrders);
+
+          // With no open orders to show, an empty list would read as "no orders".
+          if (historicalOrdersError && allOrders.length === 0) {
+            throw historicalOrdersError;
+          }
+          if (historicalOrdersError) {
+            // the list holds only the open orders
+            markIncomplete();
+          }
+          if (filter === "filled") {
+            return allOrders.filter((o) => o.status === "filled");
+          }
+          return allOrders;
+        },
+        // the filter changes the list, so each filter is cached on its own
+        cacheKey: `all-active-orders-sqs-${input.userOsmoAddress}-${input.filter ?? "all"}`,
+        ttl: 10000,
+        cursor: input.cursor,
+        limit: input.limit,
+      });
+      return { ...page, historyUnavailable: page.incomplete === true };
+    }),
+  getOrderbookState: publicProcedure
+    .input(OsmoAddressSchema.required())
+    .query(async ({ input, ctx }) => {
+      const { osmoAddress } = input;
+      const orderbookState = await getOrderbookState({
+        orderbookAddress: osmoAddress,
+        chainList: ctx.chainList,
+      });
+      const askSpotPrice = tickToPrice(new Int(orderbookState.next_ask_tick));
+      const bidSpotPrice = tickToPrice(new Int(orderbookState.next_bid_tick));
+      return {
+        ...orderbookState,
+        askSpotPrice,
+        bidSpotPrice,
+      };
+    }),
+  getClaimableOrders: publicProcedure
+    .input(UserOsmoAddressSchema.required())
+    .query(async ({ input, ctx }) => {
+      const { userOsmoAddress } = input;
+      const pools = await getOrderbookPools();
+      const contractAddresses = pools.map((p) => p.contractAddress);
+
+      if (contractAddresses.length === 0 || userOsmoAddress.length === 0)
+        return [];
+
+      const promises = contractAddresses.map(
+        async (contractOsmoAddress: string) => {
+          const { baseDenom, quoteDenom } = pools.find(
+            (p) => p.contractAddress === contractOsmoAddress
+          )!;
+
+          const quoteAsset = getAssetFromAssetList({
+            coinMinimalDenom: quoteDenom,
+            assetLists: ctx.assetLists,
+          });
+          const baseAsset = getAssetFromAssetList({
+            coinMinimalDenom: baseDenom,
+            assetLists: ctx.assetLists,
+          });
+          const orders = await getOrderbookActiveOrders({
+            orderbookAddress: contractOsmoAddress,
+            userOsmoAddress: userOsmoAddress,
+            chainList: ctx.chainList,
+            baseAsset,
+            quoteAsset,
+          });
+
+          if (orders.length === 0) return [];
+
+          return orders.filter((o) => o.percentFilled.gte(new Dec(1)));
+        }
+      );
+      const ordersByContracts = await Promise.all(promises);
+      const allOrders = ordersByContracts.flatMap((p) => p);
+      return allOrders;
+    }),
+  getHistoricalOrders: publicProcedure
+    .input(UserOsmoAddressSchema.required())
+    .query(async ({ input, ctx }) => {
+      const { userOsmoAddress } = input;
+      const historicalOrders = await getOrderbookHistoricalOrders({
+        userOsmoAddress,
+        assetLists: ctx.assetLists,
+        chainList: ctx.chainList,
+      });
+      return historicalOrders;
+    }),
+  getPools: publicProcedure.query(async () => {
+    const pools = await getOrderbookPools();
+    return pools;
+  }),
+  /**
+   * Verifies whether an orderbook can be created for a given base/quote pair.
+   * Returns:
+   *  - `orderbookExists`: true if the canonical list already has this pair.
+   *  - `endpointFunctional`: true if the sidecar endpoint responded with a
+   *    usable list. On mainnet an empty list counts as non-functional: SQS
+   *    serves `[]` before ingest completes, and treating that as "no orderbook
+   *    for any pair" would offer a paid duplicate creation for every pair.
+   *    Testnet can legitimately have no canonical orderbooks.
+   */
+  verifyOrderbookCreation: publicProcedure
+    .input(
+      z.object({
+        baseDenom: z.string(),
+        quoteDenom: z.string(),
+        // Pass true immediately after creation to bypass the server-side LRU
+        // cache and get a fresh result from SQS.
+        fresh: z.boolean().optional(),
+      })
+    )
+    .query(async ({ input }) => {
+      const { baseDenom, quoteDenom, fresh } = input;
+
+      let pools: Awaited<ReturnType<typeof getOrderbookPools>>;
+      try {
+        pools = fresh
+          ? await getOrderbookPoolsFresh()
+          : await getOrderbookPools();
+      } catch {
+        return { orderbookExists: false, endpointFunctional: false };
+      }
+      const endpointFunctional = IS_TESTNET || pools.length > 0;
+
+      const orderbookExists = pools.some(
+        (pool) =>
+          (pool.baseDenom === baseDenom && pool.quoteDenom === quoteDenom) ||
+          (pool.baseDenom === quoteDenom && pool.quoteDenom === baseDenom)
+      );
+
+      return { orderbookExists, endpointFunctional };
+    }),
+  /**
+   * Delivery status of a broadcast-accepted orderbook-creation tx, straight
+   * from the node (`/cosmos/tx/v1beta1/txs/{hash}`) rather than the
+   * SQS-derived pool list, which can lag indexing. Used to reconcile a
+   * creation whose tx tracing failed before releasing the pair for another
+   * paid attempt. Distinguishes an authoritative "notFound" (the node
+   * answered: no such tx) from "unavailable" (outage, timeout, malformed
+   * response — proof of nothing); callers must keep their duplicate
+   * protection on both, but the distinction must not be erased server-side.
+   */
+  getCreateOrderbookTxStatus: publicProcedure
+    .input(
+      z.object({
+        // A tx hash is exactly 32 bytes hex; anything else is rejected before
+        // it can reach the node path interpolation.
+        txHash: z.string().regex(/^[0-9A-Fa-f]{64}$/),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      try {
+        const tx = await queryTx({
+          chainList: ctx.chainList,
+          txHash: input.txHash,
+        });
+        // A body without a well-formed tx_response proves nothing; never let
+        // a malformed 200 read as "delivered".
+        if (typeof tx?.tx_response?.code !== "number") {
+          return { status: "unavailable" as const };
+        }
+        return tx.tx_response.code === 0
+          ? { status: "delivered" as const }
+          : {
+              status: "failed" as const,
+              code: tx.tx_response.code,
+              rawLog: tx.tx_response.raw_log,
+            };
+      } catch (e) {
+        // LCDs report an unknown hash as an error whose message names the tx
+        // as not found (code 3/NotFound); only that is authoritative absence.
+        const message =
+          (e as { data?: { message?: string } })?.data?.message ??
+          (e instanceof Error ? e.message : "");
+        if (/not\s*found/i.test(message)) {
+          return { status: "notFound" as const };
+        }
+        return { status: "unavailable" as const };
+      }
+    }),
+});

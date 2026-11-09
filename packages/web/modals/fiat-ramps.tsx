@@ -1,0 +1,60 @@
+import { FunctionComponent } from "react";
+
+import { Icon } from "~/components/assets";
+import { IconButton } from "~/components/ui/button";
+import { useFeatureFlags } from "~/hooks";
+import { FiatRampKey } from "~/integrations";
+import { OnrampMoney } from "~/integrations/onrampmoney";
+import { Swapped } from "~/integrations/swapped";
+import { ModalBase, ModalBaseProps } from "~/modals";
+
+const FIAT_RAMPS_PRETTY_NAMES: Record<FiatRampKey, string> = {
+  swapped: "Swapped",
+  onrampmoney: "Onramp.money",
+};
+
+export const FiatRampsModal: FunctionComponent<
+  {
+    fiatRampKey: FiatRampKey;
+    assetKey: string;
+  } & ModalBaseProps
+> = (props) => {
+  const flags = useFeatureFlags();
+  const { fiatRampKey } = props;
+
+  return (
+    <ModalBase
+      {...props}
+      className="m-0 w-fit p-0 !bg-osmoverse-900"
+      hideCloseButton
+      hideDefaultBackButton
+    >
+      <div className="flex items-center justify-between px-6 py-4 bg-osmoverse-900 text-white-full">
+        <IconButton
+          icon={<Icon id="arrow-left-thin" />}
+          aria-label="Back"
+          className="size-12 text-wosmongton-200 hover:text-osmoverse-100 md:size-8"
+          onClick={props.onRequestBack}
+        />
+        <h6 className="">{FIAT_RAMPS_PRETTY_NAMES[fiatRampKey]}</h6>
+        <IconButton
+          aria-label="Close"
+          data-testid="close"
+          className="size-12 text-wosmongton-200 hover:text-osmoverse-100 md:size-8"
+          icon={<Icon id="close" />}
+          onClick={props.onRequestClose}
+        />
+      </div>
+      {(() => {
+        switch (fiatRampKey) {
+          case "swapped":
+            if (flags.swapped) return <Swapped {...props} />;
+          case "onrampmoney":
+            if (flags.onrampmoney) return <OnrampMoney {...props} />;
+          default:
+            return null;
+        }
+      })()}
+    </ModalBase>
+  );
+};

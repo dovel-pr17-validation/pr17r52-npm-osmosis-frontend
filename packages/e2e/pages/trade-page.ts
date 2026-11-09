@@ -1,0 +1,1198 @@
+import {
+  type BrowserContext,
+  type Locator,
+  type Page,
+  expect,
+} from "@playwright/test";
+
+import {
+  SEQUENCE_RETRY_DELAY_MS,
+  buildExplorerTxUrl,
+  isSequenceMismatch,
+  pollTxOnChain,
+} from "../utils/tx-confirm";
+import { unfoldWalletMsgYaml } from "../utils/wallet-msg";
+import { BasePage } from "./base-page";
+import { getKeplrPopupPage, waitForKeplrApproval } from "./keplr-helper";
+
+/**
+ * Page object for the /trade view (swap, buy, sell, limit orders).
+ *
+ * Transaction methods come in two flavours:
+ *   - *AndGetWalletMsg  (e.g. buyAndGetWalletMsg) -- full flow with retry logic,
+ *     returns the raw Keplr message content for test assertions.
+ *   - *AndApprove       (e.g. buyAndApprove) -- simplified fire-and-forget flow
+ *     with no retries; use when you only need to confirm the tx succeeded.
+ *
+ * All methods handle the Keplr / 1-Click Trading duality: if no popup appears
+ * within the timeout, the code assumes 1CT processed the transaction and
+ * continues to wait for the on-chain success toast.
+ */
+export class TradePage extends BasePage {
+  readonly page: Page;
+  readonly swapBtn: Locator;
+  readonly swapMaxBtn: Locator;
+  readonly flipAssetsBtn: Locator;
+  readonly exchangeRate: Locator;
+  readonly trxSuccessful: Locator;
+  readonly trxBroadcasting: Locator;
+  readonly trxLink: Locator;
+  readonly inputAmount: Locator;
+  readonly confirmSwapBtn: Locator;
+  readonly buyTabBtn: Locator;
+  readonly buyBtn: Locator;
+  readonly sellTabBtn: Locator;
+  readonly sellBtn: Locator;
+  readonly limitTabBtn: Locator;
+  readonly orderHistoryLink: Locator;
+  readonly limitPrice: Locator;
+  readonly slippageInput: Locator;
+  readonly buySellTimeout = 30_000;
+  /** Hash of the most recently broadcast tx, captured for the REST fallback. */
+  private lastTxHash?: string;
+  /** Request and response of the most recent failed router quote, logged when the swap button shows "Error". */
+  private lastQuoteError?: string;
+  private quoteRequestCount = 0;
+  private lastQuoteErrorSeq = 0;
+
+  constructor(page: Page) {
+    super(page);
+    this.page = page;
+    // The swap button only ever reads "Error" when a quote fails, so keep the
+    // router's actual response to explain the failure in CI logs. Quotes come
+    // from the `local.quoteRouter` tRPC procedure, which runs in the browser
+    // and fetches the sidecar (SQS) directly, so watch the sidecar requests.
+    const isQuoteUrl = (url: string) =>
+      /\/router\/(quote|custom-direct-quote)$/.test(new URL(url).pathname);
+    const recordQuoteError = (seq: number, url: string, detail: string) => {
+      // Body reads can finish out of order; keep the latest-arriving failure.
+      if (seq < this.lastQuoteErrorSeq) return;
+      this.lastQuoteErrorSeq = seq;
+      // Quotes are GETs, so the request payload is the URL's query string.
+      const { pathname, search } = new URL(url);
+      this.lastQuoteError = `${new Date().toISOString()} ${pathname} request=${search} ${detail}`;
+    };
+    page.on("response", async (response) => {
+      if (!isQuoteUrl(response.url())) return;
+      const seq = ++this.quoteRequestCount;
+      const body = await response.text().catch(() => "");
+      // Like the app's apiClient, treat an error payload in a 200 as a failure.
+      let payloadError = false;
+      try {
+        const data = JSON.parse(body);
+        payloadError = Boolean(data?.code) || data?.status_code >= 400;
+      } catch {
+        payloadError = true;
+      }
+      if (response.ok() && !payloadError) return;
+      recordQuoteError(
+        seq,
+        response.url(),
+        `HTTP ${response.status()} response=${body}`
+      );
+    });
+    // Timeouts and connection failures never produce a response.
+    page.on("requestfailed", (request) => {
+      if (!isQuoteUrl(request.url())) return;
+      recordQuoteError(
+        ++this.quoteRequestCount,
+        request.url(),
+        `request failed: ${request.failure()?.errorText}`
+      );
+    });
+    this.swapBtn = page.locator('//button[@data-testid="trade-button-swap"]');
+    this.buyTabBtn = page.locator('//div[@class]/button[.="Buy"]/p[@class]/..');
+    this.buyBtn = page.locator('//div[@class]/button[@class]/h6[.="Buy"]/..');
+    this.sellBtn = page.locator('//div[@class]/button[@class]/h6[.="Sell"]/..');
+    this.sellTabBtn = page.locator(
+      '//div[@class]/button[.="Sell"]/p[@class]/..'
+    );
+    this.confirmSwapBtn = page.locator('//div[@class]/button[.="Confirm"]');
+    // The Max preset pill renders its label as direct button text (it moved
+    // into the 25/50/75/Max preset row), so locate by role rather than span.
+    this.swapMaxBtn = page.getByRole("button", { name: "Max", exact: true });
+    this.flipAssetsBtn = page.locator(
+      '//div/button[contains(@class, "ease-bounce")]'
+    );
+    this.exchangeRate = page.locator('//span[@data-testid="token-price"]');
+    this.trxSuccessful = page.getByText("Transaction Successful");
+    this.trxLink = page.getByText("View explorer");
+    this.trxBroadcasting = page.locator('//h6[.="Transaction Broadcasting"]');
+    this.inputAmount = page.locator(
+      "//input[contains(@data-testid, 'trade-input')]"
+    );
+    this.limitTabBtn = page.locator('//div[@class="w-full"]/button[.="Limit"]');
+    this.orderHistoryLink = page.getByText("Order history");
+    this.limitPrice = page.locator("//div/input[@type='text']");
+    this.slippageInput = page
+      .locator('input[type="text"][inputmode="decimal"]')
+      .first();
+  }
+
+  /**
+   * Navigate to the app home and wait for the trade widget to mount.
+   *
+   * Retries with backoff because the initial page load can stall in CI.
+   * Previously this surfaced as a hard `beforeAll` timeout instead of a
+   * recoverable retry.
+   */
+  async goto(retries = 2) {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(`Retry goto attempt ${attempt}/${retries}...`);
+        }
+        await this.page.goto("/", { timeout: 30_000 });
+        await this.waitForTradeUi();
+        const currentUrl = this.page.url();
+        console.log(`FE opened at: ${currentUrl}`);
+        await this.dismissVariantsPopupIfPresent();
+        return;
+      } catch (error: any) {
+        lastError = error;
+        console.warn(
+          `WARN goto attempt ${attempt + 1}/${retries + 1} failed: ${
+            error?.message ?? error
+          }`
+        );
+        if (attempt < retries) {
+          await this.page.waitForTimeout(2000 * (attempt + 1));
+        }
+      }
+    }
+    // Always rethrow an Error (never a bare non-Error value) so the stack and
+    // context survive into CI logs.
+    throw new Error(
+      `goto failed after ${retries + 1} attempts: ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+      { cause: lastError }
+    );
+  }
+
+  async gotoOrdersHistory(timeout = 1) {
+    await this.page.waitForTimeout(1000);
+    await this.orderHistoryLink.click();
+    await this.page.waitForTimeout(1000);
+    await new Promise((f) => setTimeout(f, timeout * 1000));
+    const currentUrl = this.page.url();
+    console.log(`FE opened at: ${currentUrl}`);
+  }
+
+  async openBuyTab() {
+    await this.buyTabBtn.click();
+  }
+
+  async openSellTab() {
+    await this.sellTabBtn.click();
+  }
+
+  async openLimit() {
+    await this.limitTabBtn.click();
+    await this.page.waitForTimeout(1000);
+  }
+
+  async getLimitPrice() {
+    const lp = await this.limitPrice.inputValue();
+    console.log(`Current limit price is: ${lp}`);
+    return lp;
+  }
+
+  async setLimitPriceChange(change: string) {
+    const locator = `//button/span[contains(@class, "body2") and .="${change}"]`;
+    await this.page.locator(locator).click();
+    await this.page.waitForTimeout(1000);
+  }
+
+  async setLimitPrice(price: string) {
+    console.log(`Set Order Limit Price to: ${price}`);
+    await this.limitPrice.fill(price, { timeout: 2000 });
+  }
+
+  async flipTokenPair() {
+    await this.flipAssetsBtn.click();
+    await this.page.waitForTimeout(2000);
+    console.log("Fliped token pair.");
+  }
+
+  async clickMaxAmountButton() {
+    await this.swapMaxBtn.click({ timeout: 2000 });
+    await this.page.waitForTimeout(1000);
+    console.log("Clicked Max token amount button.");
+  }
+
+  async enterAmount(amount: string) {
+    // Just enter an amount for the swap and wait for a quote
+    await this.inputAmount.fill(amount, { timeout: 2000 });
+    await this.page.waitForTimeout(1000);
+    await expect(this.inputAmount).toHaveValue(amount, { timeout: 1000 });
+    const exchangeRate = await this.getExchangeRate();
+    console.log(`Swap ${amount} with rate: ${exchangeRate}`);
+  }
+
+  /**
+   * Obtains the Keplr popup (with headless fallback), reads the transaction
+   * message content, clicks Approve and returns the message text.
+   * Returns undefined when no popup appears (1CT / pre-approved).
+   */
+  private async approveInKeplrAndGetMsg(context: BrowserContext) {
+    const approvePage = await getKeplrPopupPage(context, { timeout: 20_000 });
+    if (!approvePage) {
+      console.log(
+        "Keplr approval popup did not appear; assuming 1-click trading is enabled or transaction was pre-approved."
+      );
+      return undefined;
+    }
+
+    await approvePage.waitForLoadState();
+    const approveBtn = approvePage.getByRole("button", { name: "Approve" });
+    await expect(approveBtn).toBeEnabled();
+    const msgContentAmount = unfoldWalletMsgYaml(
+      (await approvePage
+        .getByText("type: osmosis/poolmanager/")
+        .textContent()) ?? undefined
+    );
+    console.log(`Wallet is approving this msg: \n${msgContentAmount}`);
+    await approveBtn.click();
+    return msgContentAmount;
+  }
+
+  /**
+   * If the review-trade dialog shows a 1-Click Trading toggle in the "checked"
+   * state, disable it so the test exercises the full Keplr approval flow.
+   * Uses a short 500ms visibility check -- call sites add a 500ms waitForTimeout
+   * before invoking this, giving ~1s total for the dialog to render.
+   */
+  async disable1CTIfNeeded() {
+    const oneClickToggle =
+      '//div[@role="dialog"]//button[@data-state="checked"]';
+    if (await this.page.locator(oneClickToggle).isVisible({ timeout: 500 })) {
+      await this.page.locator(oneClickToggle).click({ timeout: 3000 });
+      console.log("Disabled 1-Click Trading toggle.");
+    }
+  }
+
+  /**
+   * If the review-trade dialog gates Confirm behind the high-loss checkbox
+   * (slippage tolerance >= 2%, price impact >= 5%, or a limit priced past
+   * market), tick it. Ungated trades render no checkbox and pass straight
+   * through. Must run after disable1CTIfNeeded and setSlippageTolerance: the
+   * former clicks any checked button in the dialog, and raising slippage
+   * re-arms (unticks) the box.
+   */
+  async acknowledgeLossIfNeeded() {
+    // Located via its sibling label: in the CI browser the checkbox exposes no
+    // accessible name, so getByRole's name filter never matches it.
+    const lossCheckbox = this.page.locator(
+      '//div[@role="dialog"]//label[contains(., "I understand this trade may lose")]/../button[@role="checkbox"]'
+    );
+    // Wait for the dialog to settle into one of its two states rather than
+    // probing for the checkbox on a fixed timer: a slow render would otherwise
+    // read as "not gated" and leave Confirm disabled.
+    const enabledConfirm = this.page.locator(
+      '//div[@class]/button[.="Confirm" and not(@disabled)]'
+    );
+    await lossCheckbox
+      .or(enabledConfirm)
+      .first()
+      .waitFor({ state: "visible", timeout: 15000 });
+    if (await lossCheckbox.isVisible()) {
+      await lossCheckbox.check({ timeout: 3000 });
+      console.log("Ticked the high-loss acknowledgement checkbox.");
+    }
+  }
+
+  /**
+   * Lightweight Keplr approval helper used by the *AndApprove methods.
+   * Delegates to the shared helper which handles both headed and headless modes.
+   */
+  async justApproveIfNeeded(context: BrowserContext) {
+    await waitForKeplrApproval(context, { timeout: 10_000 });
+  }
+
+  async swapAndGetWalletMsg(context: BrowserContext) {
+    expect(
+      await this.isInsufficientBalanceForSwap(),
+      "Insufficient balance for the swap!"
+    ).toBeFalsy();
+    console.log("Swap and Sign now..");
+    await expect(this.swapBtn, "Swap button is disabled!").toBeEnabled({
+      timeout: 15000,
+    });
+
+    await this.swapBtn.click({ timeout: 4000 });
+    await this.page.waitForTimeout(500);
+    await this.disable1CTIfNeeded();
+    await this.acknowledgeLossIfNeeded();
+    await this.confirmSwapBtn.click({ timeout: 5000 });
+
+    const msgContentAmount = await this.approveInKeplrAndGetMsg(context);
+    return msgContentAmount;
+  }
+
+  async selectAsset(token: string) {
+    const tokenLocator = "//div//button[@type]//img[@alt]";
+    const fromToken = this.page.locator(tokenLocator).nth(0);
+    await fromToken.click();
+    // we expect that after 1 second token filter is displayed.
+    await this.page.waitForTimeout(1000);
+    await this.page.getByPlaceholder("Search").fill(token);
+    const fromLocator = this.page.locator(
+      `//div/button[@data-testid='token-select-asset']//span[.='${token}']`
+    );
+    await fromLocator.click();
+  }
+
+  async selectPair(from: string, to: string) {
+    // Filter does not show already selected tokens
+    console.log(`Select pair ${from} to ${to}`);
+    const fromToken = this.page.locator(
+      "//div//button[@data-testid='token-in']//img[@alt]"
+    );
+    const toToken = this.page.locator(
+      "//div//button[@data-testid='token-out']//img[@alt]"
+    );
+    // Select From Token
+    await fromToken.click({ timeout: 10000 });
+    // we expect that after 1 second token filter is displayed.
+    await this.page.waitForTimeout(1000);
+    await this.page.getByPlaceholder("Search").fill(from);
+    // Allow search to filter results
+    await this.page.waitForTimeout(500);
+    const fromLocator = this.page
+      .locator(
+        `//div/button[@data-testid='token-select-asset']//span[.='${from}']`
+      )
+      .first();
+    // Wait for token to be visible before clicking
+    await fromLocator.waitFor({ state: "visible", timeout: 10000 });
+    await fromLocator.click({ timeout: 10000 });
+    // Select To Token
+    await toToken.click({ timeout: 10000 });
+    // we expect that after 1 second token filter is displayed.
+    await this.page.waitForTimeout(1000);
+    await this.page.getByPlaceholder("Search").fill(to);
+    // Allow search to filter results
+    await this.page.waitForTimeout(500);
+    const toLocator = this.page
+      .locator(
+        `//div/button[@data-testid='token-select-asset']//span[.='${to}']`
+      )
+      .first();
+    // Wait for token to be visible before clicking
+    await toLocator.waitFor({ state: "visible", timeout: 10000 });
+    await toLocator.click({ timeout: 10000 });
+    // we expect that after 2 seconds exchange rate is populated.
+    await this.page.waitForTimeout(2000);
+    expect(await this.getExchangeRate()).toContain(from);
+    expect(await this.getExchangeRate()).toContain(to);
+  }
+
+  async getExchangeRate() {
+    return await this.exchangeRate.innerText();
+  }
+
+  async isTransactionSuccesful(delay = 7) {
+    console.log(`Wait for a transaction success for ${delay} seconds.`);
+    await expect(this.trxSuccessful).toBeVisible({
+      timeout: delay * 1000,
+      visible: true,
+    });
+  }
+
+  async getTransactionUrl() {
+    try {
+      const trxUrl = await this.trxLink.getAttribute("href", {
+        timeout: 10000,
+      });
+      console.log(`Trx url: ${trxUrl}`);
+      await this.page.reload();
+      return trxUrl;
+    } catch (error) {
+      // The "View explorer" link lives in the same success toast that the WS
+      // TxTracer drives. The toast may never render even when the tx is
+      // confirmed on-chain (see startTxConfirmation). Fall back to the hash
+      // captured from the broadcast response so the test can still proceed.
+      if (this.lastTxHash) {
+        const fallbackUrl = buildExplorerTxUrl(this.lastTxHash);
+        console.log(
+          `Success-toast link absent; using captured tx hash: ${fallbackUrl}`
+        );
+        await this.page.reload();
+        return fallbackUrl;
+      }
+      throw error;
+    }
+  }
+
+  async isTransactionBroadcasted(delay = 5) {
+    console.log(`Wait for a transaction broadcasting for ${delay} seconds.`);
+    return await this.trxBroadcasting.isVisible({ timeout: delay * 1000 });
+  }
+
+  async isInsufficientBalance() {
+    const issufBalanceBtn = this.page.locator(
+      '//span[.="Insufficient balance"]'
+    );
+    return await issufBalanceBtn.isVisible({ timeout: 2000 });
+  }
+
+  async isInsufficientBalanceForSwap() {
+    const issufBalanceBtn = this.page.locator(
+      '//button[.="Insufficient balance"]'
+    );
+    return await issufBalanceBtn.isVisible({ timeout: 2000 });
+  }
+
+  async isSufficientBalanceForTrade() {
+    // Make sure to have sufficient balance for a trade
+    expect(
+      await this.isInsufficientBalance(),
+      "Insufficient balance for the swap!"
+    ).toBeFalsy();
+  }
+
+  async isError(settleTimeout = 5_000) {
+    const errorBtn = this.page.locator('//button[.="Error"]');
+    try {
+      await expect(errorBtn).not.toBeVisible({ timeout: settleTimeout });
+      return false;
+    } catch {
+      console.log(
+        `Swap button shows "Error". Last failed quote response: ${
+          this.lastQuoteError ?? "none captured"
+        }`
+      );
+      return true;
+    }
+  }
+
+  async showSwapInfo() {
+    const swapInfo = this.page.locator("//button//span[.='Show details']");
+    await expect(swapInfo, "Show Swap Info button not visible!").toBeVisible({
+      timeout: 10000,
+    });
+    // The disclosure renders as soon as there is an input amount but stays
+    // disabled until the quote fills the out amount, so wait for it to be
+    // enabled rather than racing the quote with the click timeout. A failed
+    // router quote shows "Error" and keeps it disabled, but the swap tool
+    // refetches the quote every 5s, so a transient router error clears by
+    // itself; the wait covers that too, whether the error is already showing
+    // or arrives while the quote is still loading.
+    const swapInfoBtn = this.page.locator(
+      "//button[.//span[.='Show details']]"
+    );
+    try {
+      await expect(
+        swapInfoBtn,
+        "Show Swap Info button is disabled!"
+      ).toBeEnabled({
+        timeout: 30_000,
+      });
+    } catch (e) {
+      console.log(
+        `Show details stayed disabled. Last failed quote response: ${
+          this.lastQuoteError ?? "none captured"
+        }`
+      );
+      throw e;
+    }
+    await swapInfo.click({ timeout: 5000 });
+  }
+
+  async getPriceInpact() {
+    const priceInpactSpan = this.page.locator(
+      '//span[.="Price Impact"]/..//span[@class="text-bullish-400" or @class="text-osmoverse-100" or @class="text-rust-400"]'
+    );
+    return await priceInpactSpan.textContent();
+  }
+
+  async takeScreenshot(name: string) {
+    await this.page.screenshot({
+      path: `screenshot-trade-${name}.png`,
+      fullPage: true,
+    });
+  }
+
+  async getSelectedSwapPair() {
+    const tokenLocator = "//div//button[@type]//img[@alt]/../h5";
+    const fromToken = this.page.locator(tokenLocator).nth(0);
+    const toToken = this.page.locator(tokenLocator).nth(1);
+    await expect(fromToken).toBeVisible({ timeout: 2000 });
+    const fromTokenText = await fromToken.innerText();
+    const toTokenText = await toToken.innerText();
+    console.log(`Current pair: ${fromTokenText}/${toTokenText}`);
+    return `${fromTokenText}/${toTokenText}`;
+  }
+
+  /**
+   * Initiates a buy transaction and retrieves the wallet message content from Keplr popup.
+   * Supports both market orders and limit orders with configurable retry logic and slippage tolerance.
+   *
+   * @param context - Browser context to handle Keplr popup windows
+   * @param options - Configuration options for the buy operation
+   * @param options.maxRetries - Maximum number of retry attempts on failure (default: 2, meaning 3 total attempts)
+   * @param options.slippagePercent - Slippage tolerance percentage as string (e.g., "3" for 3%). Applied after buy button click.
+   * @param options.limit - Whether this is a limit order (default: false). Affects message validation logic.
+   * @param options.prepareRetry - Re-fills the form before a retry. The form resets after a failed attempt, so without it the button stays disabled.
+   *
+   * @returns Object containing msgContentAmount (string | undefined)
+   *          - Returns message content if Keplr popup appears (standard wallet approval flow)
+   *          - Returns undefined if no popup appears within 20s (1-click trading or pre-approved)
+   *
+   * @throws Error if buy operation fails after all retry attempts or if insufficient balance
+   *
+   * @remarks
+   * - Checks for sufficient balance before attempting transaction
+   * - Implements automatic retry logic with 2s delay between attempts
+   * - Gracefully handles 1-click trading scenarios (no Keplr popup)
+   * - Automatically waits for blockchain confirmation before returning (40s timeout)
+   * - Each retry attempt gets a fresh success listener to avoid timeout issues
+   */
+  async buyAndGetWalletMsg(
+    context: BrowserContext,
+    options?: {
+      maxRetries?: number;
+      slippagePercent?: string;
+      limit?: boolean;
+      prepareRetry?: () => Promise<void>;
+    }
+  ) {
+    const maxRetries = options?.maxRetries ?? 2;
+    const slippagePercent = options?.slippagePercent;
+    const limit = options?.limit ?? false;
+
+    // Check for insufficient balance BEFORE retry loop - no point retrying if balance is low
+    expect(
+      await this.isInsufficientBalance(),
+      "Insufficient balance for buy! Please top up your wallet."
+    ).toBeFalsy();
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(
+            `🔄 Retry attempt ${attempt}/${maxRetries} for buy operation...`
+          );
+          await options?.prepareRetry?.();
+        }
+
+        await expect(this.buyBtn, "Buy button is disabled!").toBeEnabled({
+          timeout: this.buySellTimeout,
+        });
+
+        await this.buyBtn.click();
+        await this.page.waitForTimeout(500);
+        await this.disable1CTIfNeeded();
+
+        if (slippagePercent) {
+          await this.setSlippageTolerance(slippagePercent);
+        }
+
+        // Armed before the confirm click so a fast broadcast isn't missed.
+        // Unlike the toast alone, this reports a CheckTx rejection (such as a
+        // sequence mismatch) instead of timing out on it.
+        const confirmation = this.startTxConfirmation(40_000);
+        confirmation.catch(() => {});
+        await this.acknowledgeLossIfNeeded();
+        await this.confirmSwapBtn.click();
+
+        let msgContentAmount: string | undefined;
+        const approvePage = await getKeplrPopupPage(context, {
+          timeout: 20_000,
+        });
+
+        if (approvePage) {
+          await approvePage.waitForLoadState();
+          const approveBtn = approvePage.getByRole("button", {
+            name: "Approve",
+          });
+          await expect(approveBtn).toBeEnabled();
+          const msgTextLocator = limit
+            ? "Execute contract"
+            : "type: osmosis/poolmanager/";
+          msgContentAmount = unfoldWalletMsgYaml(
+            (await approvePage.getByText(msgTextLocator).textContent()) ??
+              undefined
+          );
+          console.log(`Wallet is approving this msg: \n${msgContentAmount}`);
+          await approveBtn.click();
+        } else {
+          console.log(
+            "Keplr approval popup did not appear; assuming 1-click trading is enabled or transaction was pre-approved."
+          );
+        }
+
+        // Successfully submitted! Now wait for transaction success
+        if (attempt > 0) {
+          console.log(
+            `✓ Buy transaction submitted after ${attempt} retry(ies)`
+          );
+        }
+
+        // IMPORTANT: Wait for actual blockchain confirmation instead of arbitrary timeout
+        // This ensures transaction is actually confirmed on-chain (or fails) before proceeding
+        // Each retry gets a fresh 40s timeout to avoid timeout exhaustion
+        await confirmation;
+
+        return { msgContentAmount };
+      } catch (error: any) {
+        const isLastAttempt = attempt === maxRetries;
+
+        if (isLastAttempt) {
+          console.error(
+            `❌ Buy operation failed after ${maxRetries + 1} attempts:`,
+            error.message ?? "Unknown error"
+          );
+          throw new Error(
+            `Failed to complete buy operation after ${
+              maxRetries + 1
+            } attempts. ` +
+              `Last error: ${
+                error.message ?? "Unknown error"
+              }. Check if wallet extension is properly configured.`
+          );
+        }
+
+        console.warn(
+          `⚠️ Buy operation failed on attempt ${attempt + 1}/${
+            maxRetries + 1
+          }. ` + `Error: ${error.message ?? "Unknown error"}. Retrying...`
+        );
+
+        // Dismiss any lingering "Review trade" modal so the next attempt starts clean
+        await this.page.keyboard.press("Escape");
+        await this.page
+          .locator(".ReactModal__Overlay")
+          .waitFor({ state: "hidden", timeout: 2000 })
+          .catch(() => {});
+        await this.page.waitForTimeout(
+          isSequenceMismatch(error) ? SEQUENCE_RETRY_DELAY_MS : 2000
+        );
+      }
+    }
+
+    // TypeScript needs this but it should never reach here
+    throw new Error("Buy operation failed unexpectedly");
+  }
+
+  /**
+   * Initiates a sell transaction and retrieves the wallet message content from Keplr popup.
+   * Supports both market orders and limit orders with configurable retry logic and slippage tolerance.
+   *
+   * @param context - Browser context to handle Keplr popup windows
+   * @param options - Configuration options for the sell operation
+   * @param options.maxRetries - Maximum number of retry attempts on failure (default: 2, meaning 3 total attempts)
+   * @param options.slippagePercent - Slippage tolerance percentage as string (e.g., "3" for 3%). Applied after sell button click.
+   * @param options.limit - Whether this is a limit order (default: false). Affects message validation logic.
+   * @param options.prepareRetry - Re-fills the form before a retry. The form resets after a failed attempt, so without it the button stays disabled.
+   *
+   * @returns Object containing msgContentAmount (string | undefined)
+   *          - Returns message content if Keplr popup appears (standard wallet approval flow)
+   *          - Returns undefined if no popup appears within 20s (1-click trading or pre-approved)
+   *
+   * @throws Error if sell operation fails after all retry attempts or if insufficient balance
+   *
+   * @remarks
+   * - Checks for sufficient balance before attempting transaction
+   * - Implements automatic retry logic with 2s delay between attempts
+   * - Gracefully handles 1-click trading scenarios (no Keplr popup)
+   * - Automatically waits for blockchain confirmation before returning (40s timeout)
+   * - Each retry attempt gets a fresh success listener to avoid timeout issues
+   */
+  async sellAndGetWalletMsg(
+    context: BrowserContext,
+    options?: {
+      maxRetries?: number;
+      slippagePercent?: string;
+      limit?: boolean;
+      prepareRetry?: () => Promise<void>;
+    }
+  ) {
+    const maxRetries = options?.maxRetries ?? 2;
+    const slippagePercent = options?.slippagePercent;
+    const limit = options?.limit ?? false;
+
+    // Check for insufficient balance BEFORE retry loop - no point retrying if balance is low
+    expect(
+      await this.isInsufficientBalance(),
+      "Insufficient balance for sell! Please top up your wallet."
+    ).toBeFalsy();
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          console.log(
+            `🔄 Retry attempt ${attempt}/${maxRetries} for sell operation...`
+          );
+          await options?.prepareRetry?.();
+        }
+
+        // Make sure Sell button is enabled
+        await expect(this.sellBtn, "Sell button is disabled!").toBeEnabled({
+          timeout: this.buySellTimeout,
+        });
+
+        await this.sellBtn.click();
+        await this.page.waitForTimeout(500);
+        await this.disable1CTIfNeeded();
+
+        if (slippagePercent) {
+          await this.setSlippageTolerance(slippagePercent);
+        }
+
+        // Armed before the confirm click so a fast broadcast isn't missed.
+        // Unlike the toast alone, this reports a CheckTx rejection (such as a
+        // sequence mismatch) instead of timing out on it.
+        const confirmation = this.startTxConfirmation(40_000);
+        confirmation.catch(() => {});
+        await this.acknowledgeLossIfNeeded();
+        await this.confirmSwapBtn.click();
+
+        let msgContentAmount: string | undefined;
+        const approvePage = await getKeplrPopupPage(context, {
+          timeout: 20_000,
+        });
+
+        if (approvePage) {
+          await approvePage.waitForLoadState();
+          const approveBtn = approvePage.getByRole("button", {
+            name: "Approve",
+          });
+          await expect(approveBtn).toBeEnabled();
+          const msgTextLocator = limit
+            ? "Execute contract"
+            : "type: osmosis/poolmanager/";
+          msgContentAmount = unfoldWalletMsgYaml(
+            (await approvePage.getByText(msgTextLocator).textContent()) ??
+              undefined
+          );
+          console.log(`Wallet is approving this msg: \n${msgContentAmount}`);
+          await approveBtn.click();
+        } else {
+          console.log(
+            "Keplr approval popup did not appear; assuming 1-click trading is enabled or transaction was pre-approved."
+          );
+        }
+
+        // Successfully submitted! Now wait for transaction success
+        if (attempt > 0) {
+          console.log(
+            `✓ Sell transaction submitted after ${attempt} retry(ies)`
+          );
+        }
+
+        // IMPORTANT: Wait for actual blockchain confirmation instead of arbitrary timeout
+        // This ensures transaction is actually confirmed on-chain (or fails) before proceeding
+        // Each retry gets a fresh 40s timeout to avoid timeout exhaustion
+        await confirmation;
+
+        return { msgContentAmount };
+      } catch (error: any) {
+        const isLastAttempt = attempt === maxRetries;
+
+        if (isLastAttempt) {
+          console.error(
+            `❌ Sell operation failed after ${maxRetries + 1} attempts:`,
+            error.message ?? "Unknown error"
+          );
+          throw new Error(
+            `Failed to complete sell operation after ${
+              maxRetries + 1
+            } attempts. ` +
+              `Last error: ${
+                error.message ?? "Unknown error"
+              }. Check if wallet extension is properly configured.`
+          );
+        }
+
+        console.warn(
+          `⚠️ Sell operation failed on attempt ${attempt + 1}/${
+            maxRetries + 1
+          }. ` + `Error: ${error.message ?? "Unknown error"}. Retrying...`
+        );
+
+        // Dismiss any lingering "Review trade" modal so the next attempt starts clean
+        await this.page.keyboard.press("Escape");
+        await this.page
+          .locator(".ReactModal__Overlay")
+          .waitFor({ state: "hidden", timeout: 2000 })
+          .catch(() => {});
+        await this.page.waitForTimeout(
+          isSequenceMismatch(error) ? SEQUENCE_RETRY_DELAY_MS : 2000
+        );
+      }
+    }
+
+    // TypeScript needs this but it should never reach here
+    throw new Error("Sell operation failed unexpectedly");
+  }
+
+  /**
+   * Captures the broadcast tx hash from the app's `/api/broadcast-transaction`
+   * response. Must be armed BEFORE the Keplr approval click, since the broadcast
+   * only happens after approval. Resolves with the lowercase tx hash.
+   */
+  private async captureBroadcastHash(timeout: number): Promise<string> {
+    const resp = await this.page.waitForResponse(
+      (r) =>
+        r.url().includes("/api/broadcast-transaction") &&
+        r.request().method() === "POST",
+      { timeout }
+    );
+    const body = (await resp.json()) as {
+      tx_response?: {
+        txhash?: string;
+        code?: number;
+        codespace?: string;
+        raw_log?: string;
+      };
+      code?: number;
+      message?: string;
+    };
+    const txResponse = body?.tx_response;
+    const hash = txResponse?.txhash;
+
+    // Surface the broadcast result so a tx that is rejected at CheckTx (returns a
+    // hash but is never included → LCD "tx not found") is diagnosable from CI
+    // logs. `code === 0` means accepted into the mempool; a non-zero `code` +
+    // `raw_log`/`codespace` is the ante-handler rejection reason (sequence, fee,
+    // signature, etc.).
+    console.log(
+      `Broadcast response: httpStatus=${resp.status()} ` +
+        `code=${txResponse?.code ?? body?.code ?? "?"} ` +
+        `codespace=${txResponse?.codespace ?? "-"} ` +
+        `txhash=${hash ?? "none"}` +
+        (txResponse?.raw_log ? ` raw_log=${txResponse.raw_log}` : "") +
+        (!txResponse && body?.message ? ` message=${body.message}` : "")
+    );
+
+    if (!hash) {
+      throw new Error(
+        `broadcast response contained no txhash (httpStatus=${resp.status()}, ` +
+          `code=${txResponse?.code ?? body?.code ?? "?"}, ` +
+          `message=${body?.message ?? txResponse?.raw_log ?? "none"})`
+      );
+    }
+    // A non-zero code here is a CheckTx rejection: a hash is returned but the
+    // tx never enters a block, so the LCD poll would spin until its budget
+    // expired and the test would die on Playwright's timeout with no reason
+    // attached. Fail now, carrying the ante-handler's own explanation.
+    const broadcastCode = txResponse?.code ?? body?.code;
+    if (typeof broadcastCode === "number" && broadcastCode !== 0) {
+      throw new Error(
+        `tx ${hash} rejected at CheckTx (code ${broadcastCode}, ` +
+          `codespace ${txResponse?.codespace ?? "-"}): ` +
+          `${txResponse?.raw_log ?? body?.message ?? "no log"}`
+      );
+    }
+    return String(hash).toLowerCase();
+  }
+
+  /**
+   * Confirms a just-submitted transaction succeeded, resilient to WebSocket
+   * flakiness.
+   *
+   * Two signals race:
+   *   1. Primary (WebSocket): the in-app "Transaction Successful" toast, driven
+   *      by the app's WS `TxTracer`. Fast, but the WebSocket can stall or
+   *      disconnect, so the toast may never render even when the tx is included
+   *      on-chain.
+   *   2. Fallback (REST): capture the broadcast tx hash and poll the Osmosis LCD
+   *      `GET /cosmos/tx/v1beta1/txs/{hash}` directly from Node, passing as soon
+   *      as the tx is on-chain with code 0.
+   *
+   * Whichever confirms first wins; the loser is aborted. Only if BOTH fail does
+   * this reject. This must be armed before the Keplr approval click (mirroring
+   * the previous `expect(trxSuccessful).toBeVisible()` arm) so the broadcast
+   * response isn't missed.
+   *
+   * The budget must outlast the worst-case `waitForKeplrApproval` retry window
+   * (up to 3 load+Approve attempts with reloads between, ~60-75s when the popup
+   * is slow/blank in CI). The broadcast can't land until Approve is clicked, and
+   * this deadline is anchored before that click, so a too-short budget would time
+   * out mid-retry and spuriously fail an approval that ultimately succeeds.
+   */
+  startTxConfirmation(timeout = 120_000): Promise<void> {
+    // Clear any hash from a previous trade so getTransactionUrl can't reuse it.
+    this.lastTxHash = undefined;
+    const controller = new AbortController();
+
+    // Guard against a stale "Transaction Successful" toast from a previous trade
+    // (success toasts auto-close after ~7s): if one is already visible, wait for
+    // it to *hide* and then for a fresh toast to become visible, so we confirm
+    // on THIS trade's toast rather than resolving instantly on the old one —
+    // and, since the confirm flow runs concurrently, without discarding the
+    // in-flight trade's toast either. On the normal path (no toast present) we
+    // proceed straight to the visible-wait. If the stale toast never clears
+    // within the bound, the hidden-wait throws and this branch defers to the
+    // REST poll (a still-visible toast can't be disambiguated from text alone).
+    const toastPromise = (async () => {
+      const stale = await this.trxSuccessful.isVisible().catch(() => false);
+      if (stale) {
+        await this.trxSuccessful.waitFor({ state: "hidden", timeout: 8_000 });
+      }
+      await this.trxSuccessful.waitFor({ state: "visible", timeout });
+      return "WebSocket toast" as const;
+    })();
+
+    // Give the on-chain REST poll a full `timeout` budget measured from when
+    // the broadcast hash is captured, rather than the leftover of a single
+    // shared deadline. Keplr review/approval happens before the broadcast, so
+    // a shared deadline could otherwise starve the REST fallback of time to
+    // observe on-chain inclusion even when the tx actually succeeded.
+    const restPromise = this.captureBroadcastHash(timeout).then((hash) => {
+      // If the toast already won and aborted this branch, don't mutate shared
+      // state from the losing branch: a late-resolving capture (e.g. from a
+      // back-to-back trade) could otherwise clobber `lastTxHash`.
+      if (controller.signal.aborted) {
+        throw new Error(
+          "REST confirmation branch aborted before hash capture."
+        );
+      }
+      this.lastTxHash = hash;
+      console.log(`Captured broadcast tx hash: ${hash}`);
+      return pollTxOnChain(hash, {
+        timeout,
+        signal: controller.signal,
+      }).then(() => "REST LCD poll" as const);
+    });
+
+    // A non-zero on-chain code is deterministic: the tx is included and failed,
+    // so the toast will never arrive. Racing that rejection against the pair
+    // below surfaces the chain error immediately instead of letting the toast
+    // branch run out its budget (which exceeds Playwright's test timeout and
+    // would report a generic timeout instead of the real reason).
+    const chainFailure = restPromise.then(
+      () => new Promise<never>(() => {}),
+      (err: Error) => {
+        if (
+          err?.message?.includes("failed on-chain") ||
+          err?.message?.includes("rejected at CheckTx")
+        ) {
+          throw err;
+        }
+        return new Promise<never>(() => {});
+      }
+    );
+
+    // After Promise.any settles on the winner, the losing branch keeps running
+    // and eventually rejects (the toast `waitFor` times out, or the REST poll
+    // aborts). Attach no-op catches so that late rejection doesn't surface as
+    // an unhandled promise rejection in Playwright/Node.
+    toastPromise.catch(() => {});
+    restPromise.catch(() => {});
+    chainFailure.catch(() => {});
+
+    return Promise.race([
+      Promise.any([toastPromise, restPromise]),
+      chainFailure,
+    ])
+      .then((winner) => {
+        controller.abort();
+        console.log(`Transaction confirmed via ${winner}.`);
+      })
+      .catch((err: any) => {
+        controller.abort();
+        const detail = err?.errors
+          ? err.errors.map((e: any) => e?.message ?? String(e)).join(" | ")
+          : (err?.message ?? String(err));
+        throw new Error(
+          `Transaction not confirmed via WebSocket toast or on-chain REST poll: ${detail}`
+        );
+      });
+  }
+
+  /**
+   * Initiates a sell transaction with simplified approval flow.
+   * Automatically waits for transaction confirmation on blockchain.
+   *
+   * @param context - Browser context to handle potential Keplr popup windows
+   * @param options - Configuration options for the sell operation
+   * @param options.slippagePercent - Slippage tolerance percentage as string (e.g., "3" for 3%). Applied after sell button click.
+   *
+   * @remarks
+   * - Waits for sell button to be enabled before proceeding
+   * - Automatically approves transaction in Keplr if popup appears (10s event-driven timeout)
+   * - Gracefully handles 1-click trading (no popup scenario)
+   * - Confirms via WebSocket toast OR REST poll (see startTxConfirmation)
+   * - No retry logic - for retry support, use sellAndGetWalletMsg()
+   */
+  async sellAndApprove(
+    context: BrowserContext,
+    options?: { slippagePercent?: string }
+  ) {
+    const slippagePercent = options?.slippagePercent;
+
+    await expect(this.sellBtn, "Sell button is disabled!").toBeEnabled({
+      timeout: this.buySellTimeout,
+    });
+
+    await this.sellBtn.click();
+    await this.page.waitForTimeout(500);
+    await this.disable1CTIfNeeded();
+
+    if (slippagePercent) {
+      await this.setSlippageTolerance(slippagePercent);
+    }
+
+    const confirmation = this.startTxConfirmation();
+    await this.acknowledgeLossIfNeeded();
+    await this.confirmSwapBtn.click();
+    await this.justApproveIfNeeded(context);
+    await confirmation;
+  }
+
+  /**
+   * Initiates a buy transaction with simplified approval flow.
+   * Automatically waits for transaction confirmation on blockchain.
+   *
+   * @param context - Browser context to handle potential Keplr popup windows
+   * @param options - Configuration options for the buy operation
+   * @param options.slippagePercent - Slippage tolerance percentage as string (e.g., "3" for 3%). Applied after buy button click.
+   *
+   * @remarks
+   * - Waits for buy button to be enabled before proceeding
+   * - Automatically approves transaction in Keplr if popup appears (10s event-driven timeout)
+   * - Gracefully handles 1-click trading (no popup scenario)
+   * - Confirms via WebSocket toast OR REST poll, armed before the confirm click (see startTxConfirmation)
+   * - No retry logic - for retry support, use buyAndGetWalletMsg()
+   */
+  async buyAndApprove(
+    context: BrowserContext,
+    options?: { slippagePercent?: string }
+  ) {
+    const slippagePercent = options?.slippagePercent;
+
+    await expect(this.buyBtn, "Buy button is disabled!").toBeEnabled({
+      timeout: this.buySellTimeout,
+    });
+
+    await this.buyBtn.click();
+    await this.page.waitForTimeout(500);
+    await this.disable1CTIfNeeded();
+
+    if (slippagePercent) {
+      await this.setSlippageTolerance(slippagePercent);
+    }
+
+    const confirmation = this.startTxConfirmation();
+    await this.acknowledgeLossIfNeeded();
+    await this.confirmSwapBtn.click();
+    await this.justApproveIfNeeded(context);
+    await confirmation;
+  }
+
+  /**
+   * Sets the slippage tolerance in the review swap modal.
+   * Must be called AFTER clicking swap button but BEFORE clicking confirm.
+   * @param slippagePercent - Slippage percentage as string (e.g., "3" for 3%)
+   */
+  async setSlippageTolerance(slippagePercent: string) {
+    console.log(`⚙️  Setting slippage tolerance to ${slippagePercent}%...`);
+
+    try {
+      // Wait for review modal and slippage input to be visible
+      await this.slippageInput.waitFor({ state: "visible", timeout: 5000 });
+
+      // Click to focus the input
+      await this.slippageInput.click();
+
+      // Clear and set new value
+      await this.slippageInput.fill(slippagePercent);
+
+      // Verify the value was actually set
+      await expect(this.slippageInput).toHaveValue(slippagePercent, {
+        timeout: 2000,
+      });
+
+      console.log(`✓ Slippage tolerance confirmed set to ${slippagePercent}%`);
+    } catch (error: any) {
+      console.warn(`⚠️  Could not set slippage tolerance: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Initiates a swap transaction with retry logic and automatic confirmation.
+   * Handles race conditions where quote refreshes temporarily disable the swap button.
+   *
+   * @param context - Browser context to handle potential Keplr popup windows
+   * @param options - Configuration options for the swap operation
+   * @param options.maxRetries - Maximum number of retry attempts on failure (default: 3, meaning 4 total attempts)
+   * @param options.slippagePercent - Slippage tolerance percentage as string (e.g., "3" for 3%). Applied after swap button click.
+   *
+   * @remarks
+   * - Checks for sufficient balance before attempting swap
+   * - Implements automatic retry logic with 1.5s delay for quote refresh race conditions
+   * - Automatically approves transaction in Keplr if popup appears (10s event-driven timeout)
+   * - Gracefully handles 1-click trading (no popup scenario)
+   * - Confirms via WebSocket toast OR REST poll, armed before the confirm click (see startTxConfirmation)
+   * - Retries only on swap button disabled errors; other errors fail immediately
+   */
+  async swapAndApprove(
+    context: BrowserContext,
+    options?: { maxRetries?: number; slippagePercent?: string }
+  ) {
+    const maxRetries = options?.maxRetries ?? 3;
+    const slippagePercent = options?.slippagePercent;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        expect(
+          await this.isInsufficientBalanceForSwap(),
+          "Insufficient balance for the swap!"
+        ).toBeFalsy();
+        console.log("Swap and Sign now..");
+        await expect(this.swapBtn, "Swap button is disabled!").toBeEnabled({
+          timeout: this.buySellTimeout,
+        });
+
+        await this.swapBtn.click({ timeout: 4000 });
+        await this.page.waitForTimeout(500);
+        await this.disable1CTIfNeeded();
+
+        if (slippagePercent) {
+          await this.setSlippageTolerance(slippagePercent);
+        }
+
+        const confirmation = this.startTxConfirmation();
+        await this.acknowledgeLossIfNeeded();
+        await this.confirmSwapBtn.click({ timeout: 5000 });
+        await this.justApproveIfNeeded(context);
+
+        if (attempt > 0) {
+          console.log(
+            `✓ Swap transaction submitted after ${attempt} retry(ies)`
+          );
+        }
+
+        await confirmation;
+
+        return;
+      } catch (error: any) {
+        const isDisabledError =
+          error.message?.includes("disabled") ||
+          error.message?.includes("toBeEnabled");
+
+        if (attempt < maxRetries && isDisabledError) {
+          console.warn(
+            `⚠️  RACE CONDITION DETECTED: Swap button disabled ` +
+              `(attempt ${attempt + 1}/${maxRetries + 1}). ` +
+              `Waiting for quote to stabilize and retrying...`
+          );
+
+          await this.page.waitForTimeout(1500);
+
+          const rate = await this.getExchangeRate().catch(() => "N/A");
+          console.log(`Exchange rate after wait: ${rate}`);
+
+          continue;
+        }
+
+        throw error;
+      }
+    }
+  }
+}

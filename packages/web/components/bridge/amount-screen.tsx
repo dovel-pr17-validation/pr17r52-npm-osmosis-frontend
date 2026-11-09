@@ -1,0 +1,1885 @@
+import {
+  Disclosure,
+  DisclosureButton,
+  DisclosurePanel,
+} from "@headlessui/react";
+import { BridgeChain } from "@osmosis-labs/bridge";
+import { MinimalAsset } from "@osmosis-labs/types";
+import { IntPretty } from "@osmosis-labs/unit";
+import { isNil, noop, shorten } from "@osmosis-labs/utils";
+import classNames from "classnames";
+import {
+  Dispatch,
+  FunctionComponent,
+  memo,
+  ReactNode,
+  SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useMeasure } from "react-use";
+
+import { Icon } from "~/components/assets";
+import { BridgeReceiveAssetDropdown } from "~/components/bridge/bridge-receive-asset-dropdown";
+import { CryptoFiatInput } from "~/components/control/crypto-fiat-input";
+import { SkeletonLoader, Spinner } from "~/components/loaders";
+import {
+  Screen,
+  ScreenManager,
+  useScreenManager,
+} from "~/components/screen-manager";
+import { Button } from "~/components/ui/button";
+import { EntityImage } from "~/components/ui/entity-image";
+import { OsmosisChainInfo } from "~/config/chain";
+import { EthereumChainIds } from "~/config/wagmi";
+import {
+  useConnectWalletModalRedirect,
+  useDisclosure,
+  useFeatureFlags,
+  useTranslation,
+} from "~/hooks";
+import { BridgeScreen } from "~/hooks/bridge";
+import { useEvmWalletAccount, useSwitchEvmChain } from "~/hooks/evm-wallet";
+import { usePrice } from "~/hooks/queries/assets/use-price";
+import { usePhantomWallet } from "~/hooks/use-phantom-wallet";
+import { useWallet } from "~/hooks/use-wallet";
+import { BridgeChainWithDisplayInfo } from "~/server/api/routers/bridge-transfer";
+import {
+  depositHaltReasonKey,
+  withdrawalHaltReasonKey,
+} from "~/utils/halt-reasons";
+import { getLogoURIs } from "~/utils/logo-uri";
+import { api } from "~/utils/trpc";
+
+import { ChainLogo } from "../assets/chain-logo";
+import { LinkifiedText } from "../linkified-text";
+import {
+  SupportedAssetWithAmount,
+  SupportedBridgeInfo,
+} from "./amount-and-review-screen";
+import { BridgeNetworkSelectModal } from "./bridge-network-select-modal";
+import {
+  BridgeWalletSelectModal,
+  chainTypesRequiringManualAddress,
+} from "./bridge-wallet-select-modal";
+import {
+  ExternalOnlyProviderList,
+  MoreBridgeOptionsModal,
+} from "./more-bridge-options";
+import {
+  BridgeProviderDropdownRow,
+  EstimatedTimeRow,
+  ExpandDetailsControlContent,
+  ExpectedOutputRow,
+  NetworkFeeRow,
+  ProviderFeesRow,
+  TotalFeesRow,
+} from "./quote-detail";
+import { BridgeQuote } from "./use-bridge-quotes";
+import {
+  SupportedAsset,
+  SupportedChain,
+  useBridgesSupportedAssets,
+} from "./use-bridges-supported-assets";
+
+interface AmountScreenProps {
+  direction: "deposit" | "withdraw";
+  selectedDenom: string;
+
+  assetsInOsmosis: MinimalAsset[] | undefined;
+  isLoadingAssetsInOsmosis: boolean;
+
+  bridgesSupportedAssets: ReturnType<typeof useBridgesSupportedAssets>;
+  supportedBridgeInfo: SupportedBridgeInfo;
+  hasSupportedChains: boolean;
+
+  fromChain: BridgeChainWithDisplayInfo | undefined;
+  setFromChain: (chain: BridgeChainWithDisplayInfo) => void;
+  toChain: BridgeChainWithDisplayInfo | undefined;
+  setToChain: (chain: BridgeChainWithDisplayInfo) => void;
+
+  fromAsset: SupportedAssetWithAmount | undefined;
+  setFromAsset: (asset: SupportedAssetWithAmount | undefined) => void;
+  toAsset: SupportedAsset | undefined;
+  setToAsset: (asset: SupportedAsset | undefined) => void;
+
+  manualToAddress: string | undefined;
+  setManualToAddress: (address: string | undefined) => void;
+
+  toAddress: string | undefined;
+
+  cryptoAmount: string;
+  fiatAmount: string;
+  setCryptoAmount: (amount: string) => void;
+  setFiatAmount: (amount: string) => void;
+
+  quote: BridgeQuote;
+
+  onConfirm: () => void;
+}
+
+export const AmountScreen = memo(
+  ({
+    direction,
+    selectedDenom,
+
+    assetsInOsmosis,
+    isLoadingAssetsInOsmosis,
+
+    bridgesSupportedAssets: {
+      supportedAssetsByChainId: counterpartySupportedAssetsByChainId,
+      supportedChains,
+      isLoading: isLoadingSupportedAssets,
+    },
+    supportedBridgeInfo,
+    hasSupportedChains,
+
+    fromChain,
+    setFromChain,
+    toChain,
+    setToChain,
+
+    fromAsset,
+    setFromAsset,
+    toAsset,
+    setToAsset,
+
+    manualToAddress,
+    setManualToAddress,
+
+    toAddress,
+
+    cryptoAmount,
+    setCryptoAmount,
+    fiatAmount,
+    setFiatAmount,
+
+    quote,
+
+    onConfirm,
+  }: AmountScreenProps) => {
+    const { setCurrentScreen } = useScreenManager();
+    const walletApi = useWallet();
+    const { t } = useTranslation();
+    const featureFlags = useFeatureFlags();
+
+    const {
+      selectedQuote,
+      buttonText,
+      isLoadingBridgeQuote,
+      isInsufficientBal,
+      isInsufficientFee,
+      highLossWarningActive,
+      errorBoxMessage,
+      warningBoxMessage,
+    } = quote;
+
+    const [areMoreOptionsVisible, setAreMoreOptionsVisible] = useState(false);
+    const [isNetworkSelectVisible, setIsNetworkSelectVisible] = useState(false);
+    const [pendingChainApproval, setPendingChainApproval] = useState(false);
+
+    const [inputUnit, setInputUnit] = useState<"crypto" | "fiat">("fiat");
+
+    // True once the user deliberately picks a withdraw variant from the receive
+    // dropdown. While true, the realign effect won't re-point `toAsset` to the
+    // provider list's current index 0, so a later provider settle or a
+    // background refetch that cosmetically reorders index 0 can't swap the asset
+    // out from under a deliberate choice. Self-resets whenever `toAsset` returns
+    // to nil (chain switch resetAssets(), or the parent's onTransfer reset) —
+    // see the realign effect, which is the single reset point.
+    const userHasPickedToAssetRef = useRef(false);
+
+    const {
+      isOpen: isBridgeWalletSelectOpen,
+      onClose: onCloseBridgeWalletSelect,
+      onOpen: onOpenBridgeWalletSelect,
+    } = useDisclosure();
+
+    // Wallets
+    const { wallet: osmosisAccount } = walletApi;
+    const {
+      address: evmAddress,
+      connector: evmConnector,
+      isConnected: isEvmWalletConnected,
+      chainId: evmWalletCurrentChainId,
+      isConnecting,
+    } = useEvmWalletAccount();
+    const { switchChain: switchEvmChain } = useSwitchEvmChain();
+    const { address: phantomAddress } = usePhantomWallet({
+      restoreSession: featureFlags.solanaSkipRoutes === true,
+    });
+
+    const fromCosmosChainId =
+      !isNil(fromChain) && fromChain.chainType === "cosmos"
+        ? fromChain.chainId
+        : undefined;
+    // falls back to Osmosis when there is no cosmos chain; ignored in that case
+    const { wallet: fromCosmosWallet, address: fromCosmosWalletAddress } =
+      useWallet(fromCosmosChainId);
+    const fromCosmosCounterpartyAccount = fromCosmosChainId
+      ? fromCosmosWallet
+      : undefined;
+    const fromCosmosCounterpartyAddress = fromCosmosChainId
+      ? fromCosmosWalletAddress
+      : undefined;
+
+    const chainThatNeedsWalletConnection =
+      direction === "deposit" ? fromChain : toChain;
+
+    const chainThatNeedsConnectionIsManual = useMemo(() => {
+      if (isNil(chainThatNeedsWalletConnection)) return false;
+      return chainTypesRequiringManualAddress.includes(
+        chainThatNeedsWalletConnection.chainType as (typeof chainTypesRequiringManualAddress)[number]
+      );
+    }, [chainThatNeedsWalletConnection]);
+
+    const cosmosChainIdRequiringConnection =
+      !isNil(chainThatNeedsWalletConnection) &&
+      chainThatNeedsWalletConnection.chainType === "cosmos"
+        ? chainThatNeedsWalletConnection.chainId
+        : undefined;
+    // falls back to Osmosis when there is no cosmos chain; ignored in that case
+    const { address: cosmosWalletAddressRequiringConnection } = useWallet(
+      cosmosChainIdRequiringConnection
+    );
+    const cosmosAddressRequiringConnection = cosmosChainIdRequiringConnection
+      ? cosmosWalletAddressRequiringConnection
+      : undefined;
+    const isWalletNeededConnected = useMemo(() => {
+      if (isNil(chainThatNeedsWalletConnection)) return false;
+
+      if (!isNil(manualToAddress)) return true;
+
+      if (chainThatNeedsWalletConnection.chainType === "evm") {
+        return isEvmWalletConnected;
+      }
+
+      // Solana deposits sign with Phantom; withdrawals to Solana still go
+      // through the manual-address flow below (the address can be
+      // autofilled from Phantom there, but must be confirmed).
+      if (
+        direction === "deposit" &&
+        chainThatNeedsWalletConnection.chainType === "solana"
+      ) {
+        return !isNil(phantomAddress);
+      }
+
+      if (chainThatNeedsConnectionIsManual) {
+        return !isNil(manualToAddress);
+      }
+
+      return !!cosmosAddressRequiringConnection;
+    }, [
+      cosmosAddressRequiringConnection,
+      chainThatNeedsWalletConnection,
+      direction,
+      isEvmWalletConnected,
+      manualToAddress,
+      phantomAddress,
+      chainThatNeedsConnectionIsManual,
+    ]);
+
+    const { data: osmosisChain } = api.edge.chains.getCosmosChain.useQuery(
+      {
+        findChainNameOrId: OsmosisChainInfo.chainId,
+      },
+      {
+        throwOnError: true,
+      }
+    );
+
+    const canonicalAsset = assetsInOsmosis?.[0];
+
+    const {
+      price: canonicalAssetPrice,
+      isLoading: isLoadingCanonicalAssetPrice,
+    } = usePrice(
+      /**
+       * Use the canonical osmosis asset to determine the price of the assets.
+       * This is because providers can return variant assets that are missing in
+       * our asset list.
+       */
+      canonicalAsset,
+      {
+        retry: false,
+      }
+    );
+
+    // Set initial input unit based on price availability
+    useEffect(() => {
+      // The price query stays disabled until the asset resolves, and a
+      // disabled query does not report loading, so wait for the asset first or
+      // a cold load flips to crypto before the price has been requested.
+      if (!canonicalAsset || isLoadingCanonicalAssetPrice) return;
+
+      // Default to crypto mode when price is not available
+      if (!canonicalAssetPrice && inputUnit === "fiat") {
+        // eslint-disable-next-line hooks-compat/set-state-in-effect -- falls back to crypto once the price query settles with no price; the user can still switch units afterwards
+        setInputUnit("crypto");
+      }
+    }, [
+      canonicalAsset,
+      canonicalAssetPrice,
+      isLoadingCanonicalAssetPrice,
+      inputUnit,
+    ]);
+
+    const firstSupportedEvmChain = useMemo(
+      () =>
+        supportedChains.find(
+          (
+            chain
+          ): chain is Extract<
+            BridgeChainWithDisplayInfo,
+            { chainType: "evm" }
+          > => chain.chainType === "evm"
+        ),
+      [supportedChains]
+    );
+    const firstSupportedCosmosChain = useMemo(
+      () =>
+        supportedChains.find(
+          (
+            chain
+          ): chain is Extract<
+            BridgeChainWithDisplayInfo,
+            { chainType: "cosmos" }
+          > => chain.chainType === "cosmos"
+        ),
+      [supportedChains]
+    );
+
+    const hasMoreThanOneChainType =
+      !isNil(firstSupportedCosmosChain) && !isNil(firstSupportedEvmChain);
+
+    const checkChainAndConnectWallet = useCallback(
+      (chainParam?: BridgeChainWithDisplayInfo) => {
+        const chain =
+          chainParam ?? (direction === "deposit" ? fromChain : toChain);
+
+        if (!chain || !isNil(manualToAddress)) return;
+        if (chain.chainType === "evm") {
+          if (
+            (isEvmWalletConnected &&
+              evmWalletCurrentChainId === chain.chainId) ||
+            isConnecting
+          ) {
+            return;
+          }
+
+          if (
+            isEvmWalletConnected &&
+            evmWalletCurrentChainId !== chain.chainId
+          ) {
+            switchEvmChain({
+              chainId: chain.chainId as EthereumChainIds,
+            });
+          } else {
+            onOpenBridgeWalletSelect();
+          }
+        } else if (chain.chainType === "cosmos") {
+          const account = walletApi.getChainWallet(chain.chainId).wallet;
+          const accountRepo = walletApi.getChainWallet(chain.chainId);
+
+          if (
+            // If the account is already connected
+            account?.isWalletConnected
+          ) {
+            return;
+          }
+
+          setPendingChainApproval(true);
+
+          accountRepo
+            ?.connect(osmosisAccount?.walletName)
+            .catch((error) => {
+              console.error("Failed to connect Osmosis account:", error);
+              if (supportedChains.length > 1) {
+                setIsNetworkSelectVisible(true);
+              }
+            })
+            .finally(() => setPendingChainApproval(false));
+        } else if (chainThatNeedsConnectionIsManual) {
+          onOpenBridgeWalletSelect();
+        }
+      },
+      [
+        walletApi,
+        direction,
+        evmWalletCurrentChainId,
+        fromChain,
+        isConnecting,
+        isEvmWalletConnected,
+        manualToAddress,
+        onOpenBridgeWalletSelect,
+        osmosisAccount?.walletName,
+        supportedChains.length,
+        switchEvmChain,
+        toChain,
+        chainThatNeedsConnectionIsManual,
+      ]
+    );
+
+    const {
+      accountActionButton: connectWalletButton,
+      walletConnected: osmosisWalletConnected,
+    } = useConnectWalletModalRedirect(
+      {
+        className: "w-full",
+      },
+      noop,
+      undefined,
+      checkChainAndConnectWallet
+    );
+
+    const supportedSourceAssets: SupportedAsset[] | undefined = useMemo(() => {
+      if (!fromChain) return undefined;
+
+      // Use Osmosis Assets to get the source asset
+      if (direction === "withdraw") {
+        const selectedAsset = assetsInOsmosis?.find(
+          (asset) =>
+            asset.coinDenom === selectedDenom ||
+            asset.coinMinimalDenom === selectedDenom
+        );
+        if (!selectedAsset) return undefined;
+        return [
+          {
+            address: selectedAsset.coinMinimalDenom,
+            decimals: selectedAsset.coinDecimals,
+            chainId: fromChain.chainId,
+            chainType: fromChain.chainType,
+            denom: selectedAsset.coinDenom,
+            supportedVariants: {
+              [selectedAsset.coinMinimalDenom]: {},
+            },
+            transferTypes: [],
+          },
+        ];
+      }
+
+      return counterpartySupportedAssetsByChainId[fromChain.chainId];
+    }, [
+      assetsInOsmosis,
+      counterpartySupportedAssetsByChainId,
+      direction,
+      fromChain,
+      selectedDenom,
+    ]);
+
+    const balanceSource = (() => {
+      if (!fromChain || !supportedSourceAssets) return undefined;
+      const assets = supportedSourceAssets.filter(
+        (asset) => asset.chainType === fromChain.chainType
+      );
+
+      switch (fromChain.chainType) {
+        case "evm":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<SupportedAsset, { chainType: "evm" }>[],
+            userEvmAddress: evmAddress,
+          };
+        case "cosmos":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "cosmos" }
+            >[],
+            userCosmosAddress: fromCosmosCounterpartyAddress,
+          };
+        case "bitcoin":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "bitcoin" }
+            >[],
+          };
+        case "tron":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<SupportedAsset, { chainType: "tron" }>[],
+          };
+        case "penumbra":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "penumbra" }
+            >[],
+          };
+        case "doge":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<SupportedAsset, { chainType: "doge" }>[],
+          };
+        case "litecoin":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "litecoin" }
+            >[],
+          };
+        case "xrpl":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<SupportedAsset, { chainType: "xrpl" }>[],
+          };
+        case "bitcoin-cash":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "bitcoin-cash" }
+            >[],
+          };
+        case "ton":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<SupportedAsset, { chainType: "ton" }>[],
+          };
+        case "solana":
+          return {
+            type: fromChain.chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "solana" }
+            >[],
+            userSolanaAddress: phantomAddress,
+          };
+        default:
+          return {
+            type: (fromChain as BridgeChain).chainType,
+            assets: assets as Extract<
+              SupportedAsset,
+              { chainType: "solana" }
+            >[],
+          };
+      }
+    })();
+
+    const {
+      data: assetsBalances,
+      isLoading: isLoadingAssetsBalance,
+      isError: hasBalanceError,
+      isFetching: isFetchingAssetsBalance,
+      refetch: refetchAssetsBalance,
+    } = api.local.bridgeTransfer.getSupportedAssetsBalances.useQuery(
+      { source: balanceSource! },
+      {
+        enabled:
+          !isNil(fromChain) &&
+          !isNil(supportedSourceAssets) &&
+          supportedSourceAssets.length > 0 &&
+          !isNil(balanceSource),
+
+        select: (data) => {
+          let nextData: typeof data = data;
+
+          // Filter out assets with no balance
+          if (nextData && nextData.length) {
+            const filteredData = nextData.filter((asset) =>
+              asset.amount.toDec().isPositive()
+            );
+
+            // If there are no assets with balance, leave one to be selected
+            if (filteredData.length === 0) {
+              nextData = [nextData[0]];
+            } else {
+              nextData = filteredData;
+            }
+
+            if (
+              !fromAsset ||
+              (nextData[0].denom === fromAsset.denom &&
+                nextData[0].amount.toDec().gt(fromAsset.amount.toDec()))
+            ) {
+              const highestBalance = nextData.reduce(
+                (acc, curr) =>
+                  curr.amount.toDec().gt(acc.amount.toDec()) ? curr : acc,
+                nextData[0]
+              );
+
+              setFromAsset(highestBalance);
+            } else {
+              // Keep the selected asset's balance in sync with the refetch in
+              // BOTH directions. The branch above only upgrades to a larger
+              // balance, so switching to a poorer account (e.g. another
+              // Phantom account, which re-keys this query) would otherwise
+              // keep showing the previous account's spendable amount. Look
+              // up the unfiltered data: a now-empty balance is filtered out
+              // of `nextData` but must still replace the stale one.
+              const refreshed = data?.find(
+                (asset) =>
+                  asset.address === fromAsset.address &&
+                  asset.denom === fromAsset.denom
+              );
+              if (
+                refreshed &&
+                !refreshed.amount.toDec().equals(fromAsset.amount.toDec())
+              ) {
+                setFromAsset(refreshed);
+              }
+            }
+          }
+
+          return nextData;
+        },
+      }
+    );
+
+    /**
+     * Deposit
+     * Set the initial destination asset based on the source asset.
+     */
+    useEffect(() => {
+      if (
+        direction === "deposit" &&
+        !isNil(fromAsset) &&
+        !isNil(assetsInOsmosis) &&
+        isNil(toAsset)
+      ) {
+        const destinationAsset = assetsInOsmosis.find(
+          (a) =>
+            a.coinMinimalDenom === Object.keys(fromAsset.supportedVariants)[0]
+        )!;
+
+        setToAsset({
+          address: destinationAsset.coinMinimalDenom,
+          decimals: destinationAsset.coinDecimals,
+          chainId: OsmosisChainInfo.chainId,
+          chainType: "cosmos",
+          denom: destinationAsset.coinDenom,
+          // Can be left empty because for deposits we don't rely on the supported variants within the destination asset
+          supportedVariants: {},
+          transferTypes: [],
+        });
+      }
+    }, [assetsInOsmosis, toAsset, direction, setToAsset, fromAsset]);
+
+    /**
+     * Withdraw
+     * Set and maintain the destination asset for the withdraw flow.
+     *
+     * Supported assets resolve incrementally (one query per bridge provider),
+     * so the first non-empty list may be missing higher-priority providers that
+     * haven't responded yet, and a later settle (or a background refetch) can
+     * reorder index 0 — the row badged "Recommended".
+     *
+     * - Seed `toAsset` to index 0 whenever none is selected (initial load, and
+     *   after every reset that nulls `toAsset`: chain switch resetAssets(), or
+     *   the parent's onTransfer reset). Seeding never consults the user-pick
+     *   flag, so it can't be blocked into stranding `toAsset === undefined`.
+     * - Realign a still-auto-selected `toAsset` to the current index 0 only
+     *   while `userHasPickedToAssetRef` is false. This fires on the terminal
+     *   settle render (where `isLoadingSupportedAssets` is already false in the
+     *   same commit that reorders index 0, which is why a loading/interactable
+     *   gate could not cover it) but is suppressed the moment the user makes a
+     *   deliberate pick — so neither a late provider settle nor a background
+     *   refetch swaps the asset out from under a deliberate choice.
+     *
+     * The pick flag self-resets here whenever `toAsset` is nil, so user intent
+     * is cleared on every reset path without threading anything into the parent.
+     */
+    useEffect(() => {
+      if (
+        direction === "withdraw" &&
+        counterpartySupportedAssetsByChainId &&
+        toChain
+      ) {
+        if (isNil(toAsset)) {
+          userHasPickedToAssetRef.current = false;
+        }
+
+        const counterpartyAssets =
+          counterpartySupportedAssetsByChainId[toChain.chainId];
+
+        if (counterpartyAssets && counterpartyAssets.length > 0) {
+          const recommendedAsset = counterpartyAssets[0];
+          const shouldSeed = isNil(toAsset);
+          // Realign a stale auto-seeded asset to the current index 0 only while
+          // the user has not deliberately picked. The chainId guard prevents a
+          // settle observed for a chain we've already switched away from from
+          // realigning a previous-chain toAsset onto the new chain's asset.
+          const shouldRealign =
+            !userHasPickedToAssetRef.current &&
+            !isNil(toAsset) &&
+            toAsset.chainId === toChain.chainId &&
+            toAsset.address !== recommendedAsset.address;
+
+          if (shouldSeed || shouldRealign) {
+            setToAsset(recommendedAsset);
+          }
+        }
+      }
+    }, [
+      counterpartySupportedAssetsByChainId,
+      direction,
+      setToAsset,
+      toAsset,
+      toChain,
+    ]);
+
+    /**
+     * Set the osmosis chain based on the direction
+     */
+    useEffect(() => {
+      const chain = direction === "deposit" ? toChain : fromChain;
+      const setChain = direction === "deposit" ? setToChain : setFromChain;
+      if (isNil(chain) && !isNil(osmosisChain) && !isLoadingSupportedAssets) {
+        setChain({
+          chainId: osmosisChain.chain_id,
+          chainName: osmosisChain.chain_name,
+          prettyName: osmosisChain.prettyName,
+          chainType: "cosmos",
+          logoUri: osmosisChain.logo_URIs?.svg ?? osmosisChain.logo_URIs?.png,
+          // color: osmosisChain.logoURIs?.theme?.primary_color_hex,
+          bech32Prefix: osmosisChain.bech32Prefix,
+        });
+      }
+    }, [
+      direction,
+      fromChain,
+      toChain,
+      osmosisChain,
+      isLoadingSupportedAssets,
+      setFromChain,
+      setToChain,
+    ]);
+
+    /**
+     * Set the initial chain based on the direction.
+     * TODO: When all balances are computed per chain, we can default to the highest balance
+     * instead of the first one.
+     */
+    useEffect(() => {
+      const chain = direction === "deposit" ? fromChain : toChain;
+      const setChain = direction === "deposit" ? setFromChain : setToChain;
+      if (
+        isNil(chain) &&
+        !isNil(supportedChains) &&
+        supportedChains.length > 0 &&
+        !isLoadingSupportedAssets
+      ) {
+        const firstChain = supportedChains[0];
+        setChain(firstChain);
+      }
+    }, [
+      checkChainAndConnectWallet,
+      direction,
+      fromChain,
+      isLoadingSupportedAssets,
+      setFromChain,
+      setToChain,
+      supportedChains,
+      toChain,
+    ]);
+
+    /** If an asset is disabled */
+    const areAssetTransfersDisabled = useMemo(() => {
+      return direction === "withdraw"
+        ? Boolean(canonicalAsset?.areTransfersDisabled)
+        : Boolean(
+            assetsInOsmosis?.find(
+              (a) => a.coinMinimalDenom === toAsset?.address
+            )?.areTransfersDisabled
+          );
+    }, [direction, canonicalAsset, assetsInOsmosis, toAsset?.address]);
+
+    /** If the current direction is halted for this asset. Halt is distinct
+     *  from `disabled`: halted transfers show a reason and do NOT fall back
+     *  to external providers, whereas disabled transfers route to external
+     *  providers. Resolves the specific variant the user has selected so
+     *  the halt flag on a non-canonical IBC denom is not missed (mirrors
+     *  the `withdrawAsset` resolution in amount-and-review-screen). The
+     *  returned `assetDenom` is used in the banner title so it matches
+     *  the variant being blocked. */
+    const haltState = useMemo<{
+      halted: boolean;
+      reason?: string;
+      tooltip?: string;
+      assetDenom?: string;
+    }>(() => {
+      if (direction === "withdraw") {
+        const withdrawAsset =
+          assetsInOsmosis?.find(
+            (a) =>
+              a.coinDenom === selectedDenom ||
+              a.coinMinimalDenom === selectedDenom
+          ) ?? canonicalAsset;
+        return {
+          halted: Boolean(withdrawAsset?.areWithdrawalsHalted),
+          reason: withdrawAsset?.withdrawalHaltReason,
+          tooltip: withdrawAsset?.tooltipMessage,
+          assetDenom: withdrawAsset?.coinDenom,
+        };
+      }
+      const osmosisAsset = assetsInOsmosis?.find(
+        (a) => a.coinMinimalDenom === toAsset?.address
+      );
+      return {
+        halted: Boolean(osmosisAsset?.areDepositsHalted),
+        reason: osmosisAsset?.depositHaltReason,
+        tooltip: osmosisAsset?.tooltipMessage,
+        assetDenom: osmosisAsset?.coinDenom ?? canonicalAsset?.coinDenom,
+      };
+    }, [
+      direction,
+      canonicalAsset,
+      assetsInOsmosis,
+      toAsset?.address,
+      selectedDenom,
+    ]);
+
+    const fromDecimals = fromAsset?.decimals;
+    const onChangeCryptoInput = useCallback(
+      (amount: string) => {
+        if (isNil(fromDecimals)) return;
+
+        setCryptoAmount(
+          amount.endsWith(".") || amount.endsWith("0") || amount === ""
+            ? amount
+            : new IntPretty(amount)
+                .locale(false)
+                .trim(true)
+                .maxDecimals(fromDecimals)
+                .toString()
+        );
+      },
+      [fromDecimals, setCryptoAmount]
+    );
+
+    const fiatMaxDecimals = canonicalAssetPrice?.fiatCurrency.maxDecimals;
+    const onChangeFiatInput = useCallback(
+      (amount: string) => {
+        if (isNil(fiatMaxDecimals)) return;
+
+        setFiatAmount(
+          amount.endsWith(".") || amount.endsWith("0") || amount === ""
+            ? amount
+            : new IntPretty(amount)
+                .locale(false)
+                .trim(true)
+                .maxDecimals(fiatMaxDecimals)
+                .toString()
+        );
+      },
+      [fiatMaxDecimals, setFiatAmount]
+    );
+
+    const isLoading =
+      (inputUnit === "fiat" && isLoadingCanonicalAssetPrice) ||
+      isLoadingSupportedAssets ||
+      isLoadingAssetsInOsmosis ||
+      !canonicalAsset ||
+      (inputUnit === "fiat" && !canonicalAssetPrice) ||
+      // If we don't have supported chains, we won't have a fromAsset or toAsset
+      // so we can't consider the loading state.
+      // therefore we only consider the loading state if we have supported chains.
+      (hasSupportedChains &&
+        (direction === "withdraw"
+          ? !fromChain || !fromAsset
+          : !toChain || !toAsset));
+
+    // A high-loss warning does not gate this screen: the user may advance to
+    // review, where the acknowledgement checkbox lives (the surface that
+    // actually signs — see MTN-199).
+    const isTransferButtonDisabled = useMemo(() => {
+      return (
+        cryptoAmount === "" ||
+        cryptoAmount === "0" ||
+        (!quote.userCanAdvance && !highLossWarningActive)
+      );
+    }, [cryptoAmount, quote.userCanAdvance, highLossWarningActive]);
+
+    const shouldShowAssetDropdown = useMemo(() => {
+      return direction === "deposit"
+        ? !isNil(fromAsset) &&
+            Object.keys(fromAsset.supportedVariants).length > 1
+        : !isNil(toAsset) &&
+            counterpartySupportedAssetsByChainId[toAsset.chainId]?.length > 1;
+    }, [counterpartySupportedAssetsByChainId, direction, fromAsset, toAsset]);
+
+    const resetAssets = () => {
+      setFromAsset(undefined);
+      setToAsset(undefined);
+    };
+
+    const onUserSelectToAsset = useCallback(
+      (asset: SupportedAsset) => {
+        userHasPickedToAssetRef.current = true;
+        setToAsset(asset);
+      },
+      [setToAsset]
+    );
+
+    const resetInput = () => {
+      setCryptoAmount("");
+      setFiatAmount("");
+    };
+
+    const chainSelection = (
+      <div className="mb-6 flex w-full flex-col gap-2">
+        <div className="flex w-full gap-2">
+          <span className="body1 md:caption flex-1 text-osmoverse-300">
+            {t("transfer.fromNetwork")}
+          </span>
+          <Icon id="arrow-right" className="invisible md:h-4 md:w-4" />
+          <span className="body1 md:caption flex-1 text-osmoverse-300">
+            {t("transfer.toNetwork")}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-3 md:gap-2">
+          <ChainSelectorButton
+            direction={direction}
+            chainColor={fromChain?.color}
+            chainLogo={fromChain?.logoUri}
+            chains={supportedChains}
+            toChain={toChain}
+            isLoading={!fromChain}
+            onSelectChain={(nextChain) => {
+              setFromChain(nextChain);
+              resetAssets();
+              if (fromChain?.chainId !== nextChain.chainId) {
+                setManualToAddress(undefined);
+                resetInput();
+              }
+              if (osmosisWalletConnected) {
+                checkChainAndConnectWallet(nextChain);
+              }
+            }}
+            readonly={direction === "withdraw" || supportedChains.length === 1}
+            isNetworkSelectVisible={
+              direction === "withdraw" ? false : isNetworkSelectVisible
+            }
+            setIsNetworkSelectVisible={
+              direction === "withdraw" ? noop : setIsNetworkSelectVisible
+            }
+            initialManualAddress={manualToAddress}
+            onConfirmManualAddress={(address) => {
+              setManualToAddress(address);
+            }}
+          >
+            {fromChain?.prettyName}
+          </ChainSelectorButton>
+
+          <Icon id="arrow-right" className="text-osmoverse-300 md:h-4 md:w-4" />
+
+          <ChainSelectorButton
+            direction={direction}
+            chainColor={toChain?.color}
+            chainLogo={toChain?.logoUri}
+            chains={supportedChains}
+            toChain={toChain!}
+            isLoading={!toChain}
+            onSelectChain={(nextChain) => {
+              setToChain(nextChain);
+              resetAssets();
+              if (fromChain?.chainId !== nextChain.chainId) {
+                setManualToAddress(undefined);
+                resetInput();
+              }
+              if (osmosisWalletConnected) {
+                checkChainAndConnectWallet(nextChain);
+              }
+            }}
+            readonly={direction === "deposit" || supportedChains.length === 1}
+            isNetworkSelectVisible={
+              direction === "deposit" ? false : isNetworkSelectVisible
+            }
+            setIsNetworkSelectVisible={
+              direction === "deposit" ? noop : setIsNetworkSelectVisible
+            }
+            initialManualAddress={manualToAddress}
+            onConfirmManualAddress={(address) => {
+              setManualToAddress(address);
+            }}
+          >
+            {toChain?.prettyName}
+          </ChainSelectorButton>
+        </div>
+      </div>
+    );
+
+    const assetDropdown = fromAsset &&
+      toAsset &&
+      assetsInOsmosis &&
+      shouldShowAssetDropdown &&
+      !isLoading && (
+        <BridgeReceiveAssetDropdown
+          direction={direction}
+          fromAsset={fromAsset}
+          toAsset={toAsset}
+          setToAsset={setToAsset}
+          onUserSelectAsset={onUserSelectToAsset}
+          assetsInOsmosis={assetsInOsmosis}
+          counterpartySupportedAssetsByChainId={
+            counterpartySupportedAssetsByChainId
+          }
+        />
+      );
+
+    /**
+     * This condition will be met if:
+     * - An asset is disabled, effectively its FF is turned off for whatever reason
+     * - There's no supportedAssets returned from providers, so we don't know the to/from asset/chain depending on direction
+     * - Quoting is disabled for the current selection, meaning providers can't provide quotes but they may provide external URLs
+     */
+    if (
+      // A failed balance lookup must end the loading state: on deposits
+      // `isLoading` waits for the destination asset, which is derived from a
+      // source asset that only a successful balance lookup sets.
+      (!isLoading || hasBalanceError) &&
+      (!hasSupportedChains ||
+        areAssetTransfersDisabled ||
+        haltState.halted ||
+        !fromChain ||
+        !fromAsset ||
+        !toChain ||
+        !toAsset ||
+        hasBalanceError ||
+        !quote.enabled)
+    ) {
+      // When there are no supported chains (e.g. external-interface-only assets like
+      // NAM), fromAsset/toAsset/fromChain/toChain are all undefined. Build fallbacks
+      // from canonicalAsset so the MoreBridgeOptionsModal can still fire its query and
+      // surface any external_interface transfer methods from the asset list.
+      const canonicalAssetFallback = canonicalAsset
+        ? {
+            address: canonicalAsset.coinMinimalDenom,
+            decimals: canonicalAsset.coinDecimals,
+            denom: canonicalAsset.coinDenom,
+            coinGeckoId: canonicalAsset.coinGeckoId,
+          }
+        : undefined;
+      const osmosisChainFallback: BridgeChainWithDisplayInfo = {
+        chainId: OsmosisChainInfo.chainId,
+        chainType: "cosmos" as const,
+        bech32Prefix: "osmo",
+        prettyName: "Osmosis",
+      };
+
+      const fallbackFromAsset = fromAsset ?? canonicalAssetFallback;
+      const fallbackToAsset = toAsset ?? canonicalAssetFallback;
+      const fallbackFromChain =
+        fromChain ??
+        (direction === "withdraw" ? osmosisChainFallback : undefined);
+      const fallbackToChain =
+        toChain ?? (direction === "deposit" ? osmosisChainFallback : undefined);
+
+      // External-interface-only assets (e.g. NAM): no supported quote chains, no
+      // disabled flag. Show the provider list inline without a button/modal.
+      // Suppressed when halted: a kill switch must not route to external providers.
+      if (
+        !hasSupportedChains &&
+        !areAssetTransfersDisabled &&
+        !haltState.halted
+      ) {
+        return (
+          <div className="flex w-full flex-col items-center justify-center p-4 text-white-full md:py-2 md:px-0">
+            <div className="mb-6 flex w-full items-center justify-center gap-3 text-h5 font-h5 md:text-h6 md:font-h6">
+              {!canonicalAsset ? (
+                <SkeletonLoader className="h-8 w-full max-w-sm md:h-4" />
+              ) : (
+                <>
+                  <span>
+                    {direction === "deposit"
+                      ? t("transfer.deposit")
+                      : t("transfer.withdraw")}
+                  </span>{" "}
+                  <button
+                    className="flex items-center gap-3"
+                    onClick={() => setCurrentScreen(BridgeScreen.Asset)}
+                  >
+                    <div className="h-8 w-8 shrink-0 overflow-hidden rounded-full">
+                      <EntityImage
+                        logoURIs={getLogoURIs(canonicalAsset.coinImageUrl)}
+                        name={canonicalAsset.coinName}
+                        symbol={canonicalAsset.coinDenom}
+                        width={32}
+                        height={32}
+                      />
+                    </div>
+                    <span>{canonicalAsset.coinDenom}</span>
+                  </button>
+                </>
+              )}
+            </div>
+            <ExternalOnlyProviderList
+              assetDenom={canonicalAsset?.coinDenom ?? ""}
+              direction={direction}
+              fromAsset={fallbackFromAsset}
+              toAsset={fallbackToAsset}
+              fromChain={fallbackFromChain}
+              toChain={fallbackToChain}
+              toAddress={toAddress}
+              bridges={supportedBridgeInfo.allBridges}
+            />
+          </div>
+        );
+      }
+
+      return (
+        <>
+          {hasSupportedChains && chainSelection}
+          <div className="flex flex-col gap-3">
+            {haltState.halted ? (
+              <div className="flex animate-[fadeIn_0.25s] gap-3 rounded-[20px] border-2 border-rust-600 p-5 py-3">
+                <Icon
+                  id="alert-triangle"
+                  className="h-6 w-6 shrink-0 text-rust-600"
+                />
+                <div className="flex flex-col">
+                  <h1 className="body2">
+                    {direction === "deposit"
+                      ? t("transfer.depositsHalted", {
+                          asset:
+                            haltState.assetDenom ??
+                            canonicalAsset?.coinDenom ??
+                            "",
+                        })
+                      : t("transfer.withdrawalsHalted", {
+                          asset:
+                            haltState.assetDenom ??
+                            canonicalAsset?.coinDenom ??
+                            "",
+                        })}
+                  </h1>
+                  <p className="body2 text-osmoverse-300">
+                    {t(
+                      direction === "deposit"
+                        ? depositHaltReasonKey(haltState.reason)
+                        : withdrawalHaltReasonKey(haltState.reason)
+                    )}
+                  </p>
+                  {haltState.tooltip && (
+                    <p className="caption mt-1 text-osmoverse-400">
+                      <LinkifiedText text={haltState.tooltip} />
+                    </p>
+                  )}
+                </div>
+              </div>
+            ) : (
+              areAssetTransfersDisabled && (
+                <div className="flex animate-[fadeIn_0.25s] gap-3 rounded-[20px] border-2 border-rust-600 p-5 py-3">
+                  <Icon
+                    id="alert-triangle"
+                    className="h-6 w-6 shrink-0 text-rust-600"
+                  />
+                  <div className="flex flex-col">
+                    <h1 className="body2">{t("transfer.ibcConnectionDown")}</h1>
+                    <p className="body2 text-osmoverse-300">
+                      {t("transfer.ibcConnectionDownDescription", {
+                        asset: canonicalAsset?.coinDenom ?? "",
+                      })}
+                    </p>
+                  </div>
+                </div>
+              )
+            )}
+            {/* A failed balance lookup must be visible: without this the
+                user only sees the options button and assumes a zero balance. */}
+            {!haltState.halted && hasBalanceError && fromChain && (
+              <div className="flex animate-[fadeIn_0.25s] gap-3 rounded-[20px] border-2 border-rust-600 p-5 py-3">
+                <Icon
+                  id="alert-triangle"
+                  className="h-6 w-6 shrink-0 text-rust-600"
+                />
+                <div className="flex flex-col items-start gap-2">
+                  <h1 className="body2">
+                    {t("transfer.balanceUnavailable", {
+                      chain: fromChain.prettyName,
+                    })}
+                  </h1>
+                  <p className="body2 text-osmoverse-300">
+                    {t("transfer.balanceUnavailableDescription", {
+                      chain: fromChain.prettyName,
+                    })}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="xsm"
+                    onClick={() => refetchAssetsBalance()}
+                    isLoading={isFetchingAssetsBalance}
+                  >
+                    {t("transfer.retryBalance")}
+                  </Button>
+                </div>
+              </div>
+            )}
+            {!haltState.halted && (
+              <>
+                <Button
+                  variant="default"
+                  className="w-full md:h-12"
+                  onClick={() => setAreMoreOptionsVisible(true)}
+                  disabled={isNil(fallbackFromAsset) || isNil(fallbackToAsset)}
+                >
+                  <div className="md:subtitle1 text-h6 font-h6">
+                    {direction === "deposit"
+                      ? t("transfer.moreDepositOptions")
+                      : t("transfer.moreWithdrawOptions")}
+                  </div>
+                </Button>
+                <MoreBridgeOptionsModal
+                  direction={direction}
+                  isOpen={areMoreOptionsVisible}
+                  fromAsset={fallbackFromAsset}
+                  toAsset={fallbackToAsset}
+                  fromChain={fallbackFromChain}
+                  toChain={fallbackToChain}
+                  toAddress={toAddress}
+                  bridges={supportedBridgeInfo.allBridges}
+                  onRequestClose={() => setAreMoreOptionsVisible(false)}
+                />
+              </>
+            )}
+          </div>
+        </>
+      );
+    }
+
+    /**
+     * This will trigger an error boundary
+     */
+    if (!supportedSourceAssets && !isLoading) {
+      throw new Error("Supported source assets are not defined");
+    }
+
+    if (!assetsInOsmosis && !isLoading) {
+      throw new Error("Assets are not defined");
+    }
+
+    return (
+      <div className="flex w-full flex-col items-center justify-center p-4 text-white-full md:py-2 md:px-0">
+        <div className="mb-6 flex w-full items-center justify-center gap-3 text-h5 font-h5 md:text-h6 md:font-h6">
+          {!canonicalAsset ? (
+            <SkeletonLoader className="h-8 w-full max-w-sm md:h-4" />
+          ) : (
+            <>
+              <span>
+                {direction === "deposit"
+                  ? t("transfer.deposit")
+                  : t("transfer.withdraw")}
+              </span>{" "}
+              <button
+                className="flex items-center gap-3"
+                onClick={() => setCurrentScreen(BridgeScreen.Asset)}
+              >
+                <div className="h-8 w-8 shrink-0 overflow-hidden rounded-full">
+                  <EntityImage
+                    logoURIs={getLogoURIs(canonicalAsset.coinImageUrl)}
+                    name={canonicalAsset.coinName}
+                    symbol={canonicalAsset.coinDenom}
+                    width={32}
+                    height={32}
+                  />
+                </div>
+                <span>{canonicalAsset.coinDenom}</span>
+              </button>
+            </>
+          )}
+        </div>
+
+        {chainSelection}
+
+        <div className="flex w-full flex-col gap-6 md:gap-4">
+          <CryptoFiatInput
+            currentUnit={inputUnit}
+            cryptoInput={cryptoAmount}
+            fiatInput={fiatAmount}
+            assetPrice={canonicalAssetPrice}
+            assetWithBalance={fromAsset}
+            isInsufficientBal={Boolean(isInsufficientBal)}
+            isInsufficientFee={Boolean(isInsufficientFee)}
+            transferGasCost={selectedQuote?.gasCost}
+            additiveTransferFee={
+              selectedQuote?.isAdditiveFee
+                ? selectedQuote.transferFee
+                : undefined
+            }
+            /** Wait for all quotes to resolve before modifying input amount.
+             *  This helps reduce thrash while the best quote is being determined.
+             *  Only once we get the best quote, we can modify the input amount
+             *  to account for gas then restart the quote search process. */
+            canSetMax={!quote.isLoadingAnyBridgeQuote}
+            onChangeFiatInput={onChangeFiatInput}
+            onChangeCryptoInput={onChangeCryptoInput}
+            setCurrentUnit={setInputUnit}
+            transferGasChain={fromChain}
+          />
+
+          {(isLoadingAssetsBalance || isLoading) && (
+            <div className="flex w-full items-center justify-center gap-3">
+              <Spinner className="text-wosmongton-500" />
+              <p className="body1 md:body2 text-osmoverse-300">
+                {t("transfer.lookingForBalances")}
+              </p>
+            </div>
+          )}
+
+          {!isLoadingAssetsBalance &&
+            !isLoading &&
+            assetsBalances?.length === 1 && (
+              <p className="body1 md:body2 w-full text-center text-osmoverse-300">
+                {inputUnit === "crypto"
+                  ? assetsBalances[0].amount
+                      .trim(true)
+                      .maxDecimals(6)
+                      .hideDenom(true)
+                      .toString()
+                  : assetsBalances[0].usdValue.toString()}{" "}
+                {t("transfer.available")}
+              </p>
+            )}
+
+          {(isWalletNeededConnected || isLoading) && (
+            <>
+              {!isLoadingAssetsBalance &&
+                !isLoading &&
+                assetsBalances &&
+                (assetsBalances.length ?? 0) > 1 && (
+                  <div className="mx-auto flex w-full flex-wrap items-center rounded-2xl bg-osmoverse-1000">
+                    {assetsBalances.map((asset) => {
+                      const isActive =
+                        asset.amount.currency.coinMinimalDenom ===
+                        fromAsset?.address;
+                      return (
+                        <button
+                          key={asset.amount.currency.coinMinimalDenom}
+                          className={classNames(
+                            "flex flex-grow flex-col items-center rounded-2xl py-2 px-4",
+                            {
+                              "bg-osmoverse-825 text-wosmongton-100": isActive,
+                              "text-osmoverse-100": !isActive,
+                            }
+                          )}
+                          onClick={() => setFromAsset(asset)}
+                        >
+                          <span className="subtitle1 md:body2">
+                            {asset.denom}
+                          </span>
+                          <span className="body2 md:caption text-osmoverse-300">
+                            {inputUnit === "crypto" ||
+                            !asset.usdValue.toDec().isPositive()
+                              ? asset.amount
+                                  .trim(true)
+                                  .maxDecimals(6)
+                                  .hideDenom(true)
+                                  .toString()
+                              : asset.usdValue.toString()}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+            </>
+          )}
+
+          {fromChain && toChain && (
+            <BridgeWalletSelectModal
+              direction={direction}
+              isOpen={isBridgeWalletSelectOpen}
+              onRequestClose={onCloseBridgeWalletSelect}
+              onSelectChain={(chain) => {
+                const setChain =
+                  direction === "deposit" ? setFromChain : setToChain;
+                setChain(chain);
+                resetAssets();
+                setManualToAddress(undefined);
+              }}
+              evmChain={(() => {
+                const chain = direction === "deposit" ? fromChain : toChain;
+                return chain?.chainType === "evm"
+                  ? chain
+                  : firstSupportedEvmChain;
+              })()}
+              cosmosChain={(() => {
+                const chain = direction === "deposit" ? fromChain : toChain;
+                return chain?.chainType === "cosmos"
+                  ? chain
+                  : firstSupportedCosmosChain;
+              })()}
+              fromChain={fromChain}
+              toChain={toChain}
+              initialManualAddress={manualToAddress}
+              onConfirmManualAddress={(address) => {
+                setManualToAddress(address);
+              }}
+            />
+          )}
+
+          {isLoading ? (
+            <div className="flex justify-between">
+              <SkeletonLoader className="h-4 w-16" />
+              <SkeletonLoader className="h-4 w-16" />
+            </div>
+          ) : (
+            <>
+              {osmosisWalletConnected && isWalletNeededConnected && (
+                <>
+                  {hasMoreThanOneChainType || direction === "withdraw" ? (
+                    <>
+                      <button
+                        onClick={onOpenBridgeWalletSelect}
+                        className="flex items-center justify-between"
+                      >
+                        <span className="body1 md:body2 text-osmoverse-300">
+                          {direction === "deposit" ||
+                          fromChain?.chainType === toChain?.chainType
+                            ? t("transfer.transferWith")
+                            : t("transfer.transferTo")}
+                        </span>
+
+                        <WalletDisplay
+                          icon={(() => {
+                            if (
+                              direction === "withdraw" &&
+                              !isNil(manualToAddress)
+                            ) {
+                              return (
+                                <Icon
+                                  id="wallet"
+                                  className="text-wosmongton-200"
+                                />
+                              );
+                            }
+
+                            const chain =
+                              direction === "deposit" ? fromChain : toChain;
+                            return chain?.chainType === "evm"
+                              ? evmConnector?.icon
+                              : fromCosmosCounterpartyAccount?.walletInfo.logo;
+                          })()}
+                          name={(() => {
+                            if (
+                              direction === "withdraw" &&
+                              !isNil(manualToAddress)
+                            ) {
+                              return shorten(manualToAddress);
+                            }
+
+                            const chain =
+                              direction === "deposit" ? fromChain : toChain;
+                            return chain?.chainType === "evm"
+                              ? evmConnector?.name
+                              : fromCosmosCounterpartyAccount?.walletInfo
+                                  .prettyName;
+                          })()}
+                          suffix={
+                            <Icon
+                              id="chevron-down"
+                              width={12}
+                              height={12}
+                              className="text-osmoverse-300"
+                            />
+                          }
+                        />
+                      </button>
+                    </>
+                  ) : (
+                    <div className="flex items-center justify-between">
+                      <span className="body1 md:body2 text-osmoverse-300">
+                        {direction === "deposit"
+                          ? t("transfer.transferWith")
+                          : t("transfer.transferTo")}
+                      </span>
+                      <WalletDisplay
+                        icon={
+                          fromChain?.chainType === "evm"
+                            ? evmConnector?.icon
+                            : osmosisAccount?.walletInfo.logo
+                        }
+                        name={
+                          fromChain?.chainType === "evm"
+                            ? evmConnector?.name
+                            : osmosisAccount?.walletInfo.prettyName
+                        }
+                      />
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          {assetDropdown}
+
+          {fromChain && (
+            <TransferDetails
+              quote={
+                quote as BridgeQuote & {
+                  selectedQuote: NonNullable<BridgeQuote["selectedQuote"]>;
+                }
+              }
+              fromChain={fromChain}
+              isLoading={isLoadingBridgeQuote}
+            />
+          )}
+
+          <div className="flex flex-col items-center gap-4">
+            <ScreenManager
+              currentScreen={(function () {
+                if (isLoading) {
+                  return "next-step";
+                }
+
+                if (!osmosisWalletConnected && !pendingChainApproval) {
+                  return "no-osmo-wallet";
+                }
+
+                if (!isWalletNeededConnected) {
+                  return "counterparty-chain-not-connected";
+                }
+
+                if (quote.isWrongEvmChainSelected) {
+                  return "wrong-evm-chain-selected";
+                }
+
+                return "next-step";
+              })()}
+            >
+              <Screen screenName="no-osmo-wallet">{connectWalletButton}</Screen>
+
+              <Screen screenName="wrong-evm-chain-selected">
+                <Button
+                  onClick={() => checkChainAndConnectWallet()}
+                  className="w-full"
+                  variant="secondary"
+                >
+                  <h6 className="flex items-center gap-3">
+                    <Icon
+                      id="switch"
+                      className="h-6 w-6 rotate-90 transform text-wosmongton-200"
+                    />
+                    {t("transfer.changeNetworkInWallet")}
+                  </h6>
+                </Button>
+              </Screen>
+
+              <Screen screenName="counterparty-chain-not-connected">
+                <Button
+                  onClick={() => checkChainAndConnectWallet()}
+                  className="w-full"
+                  disabled={pendingChainApproval}
+                >
+                  <h6 className="flex items-center gap-3">
+                    {chainThatNeedsConnectionIsManual &&
+                    direction === "withdraw"
+                      ? t("transfer.confirmAmount")
+                      : pendingChainApproval
+                        ? t("transfer.pendingApproval")
+                        : t("transfer.connectTo", {
+                            network:
+                              direction === "deposit"
+                                ? (fromChain?.prettyName ?? "")
+                                : (toChain?.prettyName ?? ""),
+                          })}
+                  </h6>
+                </Button>
+              </Screen>
+
+              <Screen screenName="next-step">
+                {(errorBoxMessage || warningBoxMessage) && (
+                  <div className="flex animate-[fadeIn_0.25s] gap-3 rounded-[20px] border-2 border-rust-600 p-5 py-3">
+                    <Icon
+                      id="alert-triangle"
+                      className="h-6 w-6 text-rust-600"
+                    />
+                    <div className="flex flex-col">
+                      <h1 className="body2">
+                        {errorBoxMessage?.heading ?? warningBoxMessage?.heading}
+                      </h1>
+                      <p className="body2 text-osmoverse-300">
+                        {errorBoxMessage?.description ??
+                          warningBoxMessage?.description}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <Button
+                  disabled={isTransferButtonDisabled}
+                  className="w-full md:h-12"
+                  variant={highLossWarningActive ? "destructive" : "default"}
+                  onClick={onConfirm}
+                >
+                  <div className="md:subtitle1 text-h6 font-h6">
+                    {buttonText}
+                  </div>
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="w-full text-wosmongton-200 hover:text-white-full md:h-12"
+                  onClick={() => setAreMoreOptionsVisible(true)}
+                  disabled={isNil(fromAsset) || isNil(toAsset)}
+                >
+                  <div className="md:subtitle1 text-h6 font-h6">
+                    {direction === "deposit"
+                      ? t("transfer.moreDepositOptions")
+                      : t("transfer.moreWithdrawOptions")}
+                  </div>
+                </Button>
+                <MoreBridgeOptionsModal
+                  direction={direction}
+                  isOpen={areMoreOptionsVisible}
+                  fromAsset={fromAsset}
+                  toAsset={toAsset}
+                  fromChain={fromChain}
+                  toChain={toChain}
+                  toAddress={toAddress}
+                  bridges={supportedBridgeInfo.allBridges}
+                  onRequestClose={() => setAreMoreOptionsVisible(false)}
+                />
+              </Screen>
+            </ScreenManager>
+          </div>
+        </div>
+      </div>
+    );
+  }
+);
+
+interface ChainSelectorButtonProps {
+  direction: "deposit" | "withdraw";
+  readonly: boolean;
+  children: ReactNode;
+  chainLogo: string | undefined;
+  chainColor: string | undefined;
+  chains: SupportedChain[];
+  toChain: BridgeChainWithDisplayInfo | undefined;
+  onSelectChain: (chain: BridgeChainWithDisplayInfo) => void;
+  isNetworkSelectVisible: boolean;
+  setIsNetworkSelectVisible: Dispatch<SetStateAction<boolean>>;
+  initialManualAddress?: string;
+  onConfirmManualAddress: (address: string) => void;
+  isLoading: boolean;
+}
+
+const ChainSelectorButton: FunctionComponent<ChainSelectorButtonProps> = ({
+  direction,
+  readonly,
+  children,
+  chainLogo,
+  chainColor,
+  chains,
+  onSelectChain,
+  toChain,
+  isNetworkSelectVisible,
+  setIsNetworkSelectVisible,
+  onConfirmManualAddress,
+  initialManualAddress,
+  isLoading,
+}) => {
+  if (readonly) {
+    return (
+      <div className="subtitle1 md:body2 flex w-[45%] flex-1 items-center gap-2 rounded-[48px] border border-osmoverse-700 py-2 px-4 text-osmoverse-200 md:py-1 md:px-2">
+        <ChainLogo prettyName="" logoUri={chainLogo} color={chainColor} />
+        <span className="truncate">{children}</span>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <button
+        onClick={() => {
+          setIsNetworkSelectVisible(true);
+        }}
+        className={classNames(
+          "subtitle1 md:body2 group flex w-[45%] flex-1 items-center justify-between rounded-[48px] bg-osmoverse-825 py-2 px-4 text-start transition-colors duration-200 md:py-1 md:px-2",
+          {
+            "opacity-60": isLoading,
+            "hover:bg-osmoverse-850": !isLoading,
+          }
+        )}
+        disabled={isLoading}
+      >
+        <div className="flex w-[90%] items-center gap-2">
+          {isLoading ? (
+            <Spinner className="flex-shrink-0 text-wosmongton-500" />
+          ) : (
+            <ChainLogo
+              className="flex-shrink-0"
+              prettyName=""
+              logoUri={chainLogo}
+              color={chainColor}
+            />
+          )}
+          {isLoading ? (
+            <span className="subtitle1 whitespace-nowrap text-wosmongton-200">
+              Loading networks
+            </span>
+          ) : (
+            <span className="truncate">{children}</span>
+          )}
+        </div>
+        {isLoading ? null : (
+          <Icon
+            id="chevron-down"
+            className="flex-shrink-0 text-wosmongton-200 transition-colors duration-200 group-hover:text-white-full"
+            width={12}
+            height={12}
+          />
+        )}
+      </button>
+      {toChain && (
+        <BridgeNetworkSelectModal
+          isOpen={isNetworkSelectVisible}
+          chains={chains}
+          onSelectChain={async (chain) => {
+            onSelectChain(chain);
+            setIsNetworkSelectVisible(false);
+          }}
+          onRequestClose={() => setIsNetworkSelectVisible(false)}
+          direction={direction}
+          toChain={toChain}
+          initialManualAddress={initialManualAddress}
+          onConfirmManualAddress={onConfirmManualAddress}
+        />
+      )}
+    </>
+  );
+};
+
+const WalletDisplay: FunctionComponent<{
+  icon: string | ReactNode | undefined;
+  name: string | undefined;
+  suffix?: ReactNode;
+}> = ({ icon, name, suffix }) => {
+  return (
+    <div className="subtitle1 md:body2 flex items-center gap-2 rounded-lg">
+      {!isNil(icon) && (
+        <>
+          {typeof icon === "string" ? (
+            <img src={icon} alt={name} className="h-6 w-6" />
+          ) : (
+            icon
+          )}
+        </>
+      )}
+      <span title={name}>{name}</span>
+      {suffix}
+    </div>
+  );
+};
+
+const TransferDetails: FunctionComponent<{
+  quote: BridgeQuote | undefined;
+  fromChain: BridgeChainWithDisplayInfo;
+  isLoading: boolean;
+}> = ({ quote, fromChain, isLoading }) => {
+  const [detailsRef, { height: detailsHeight, y: detailsOffset }] =
+    useMeasure<HTMLDivElement>();
+  const { t } = useTranslation();
+  const successfulQuotes = quote?.successfulQuotes ?? [];
+  const isOpen = quote?.highLossWarningActive;
+
+  if (!isLoading && successfulQuotes.length === 0) {
+    return null;
+  }
+
+  return (
+    <Disclosure key={`details-disclosure-${isOpen}`} defaultOpen={isOpen}>
+      {({ open }) => (
+        <div
+          className="flex w-full flex-col gap-3 overflow-clip transition-height duration-300 ease-inOutBack"
+          style={{
+            height: open
+              ? detailsHeight + detailsOffset + 46 // collapsed height
+              : 36,
+          }}
+        >
+          <DisclosureButton>
+            <div className="flex animate-[fadeIn_0.25s] items-center justify-between">
+              {isLoading || !quote ? (
+                <div className="flex items-center gap-2">
+                  <Spinner className="text-wosmongton-500" />
+                  <p className="body1 md:body2 text-osmoverse-300">
+                    {t("transfer.estimatingTime")}
+                  </p>
+                </div>
+              ) : open ? (
+                <p className="subtitle1">{t("transfer.transferDetails")}</p>
+              ) : null}
+
+              {!isLoading && quote?.selectedQuote && !open && (
+                <div className="flex items-center gap-1">
+                  <Icon id="stopwatch" className="h-4 w-4 text-osmoverse-400" />
+                  <p className="body1 md:body2 text-osmoverse-300 first-letter:capitalize">
+                    {quote.selectedQuote.estimatedTime.humanize()}
+                  </p>
+                </div>
+              )}
+
+              {isLoading || !quote ? (
+                <span className="body1 md:body2 text-osmoverse-300">
+                  {t("transfer.calculatingFees")}
+                </span>
+              ) : null}
+
+              {!isLoading && quote?.selectedQuote ? (
+                <ExpandDetailsControlContent
+                  warnUserOfPriceImpact={quote.warnUserOfPriceImpact}
+                  warnUserOfSlippage={quote.warnUserOfSlippage}
+                  warnUserOfUnknownSwapImpact={
+                    quote.warnUserOfUnknownSwapImpact
+                  }
+                  selectedQuoteUpdatedAt={quote.selectedQuoteUpdatedAt}
+                  refetchInterval={quote.refetchInterval}
+                  selectedQuote={quote.selectedQuote}
+                  open={open}
+                  isRemainingTimePaused={
+                    quote.isRefetchingQuote || quote.isTxPending
+                  }
+                  showRemainingTime
+                />
+              ) : null}
+            </div>
+          </DisclosureButton>
+          <DisclosurePanel ref={detailsRef} className="flex flex-col gap-3">
+            {quote?.selectedQuote && (
+              <>
+                <BridgeProviderDropdownRow
+                  successfulQuotes={quote.successfulQuotes}
+                  setSelectedBridgeProvider={quote.setSelectedBridgeProvider}
+                  isRefetchingQuote={quote.isRefetchingQuote}
+                  selectedQuote={quote.selectedQuote}
+                />
+                <EstimatedTimeRow
+                  isRefetchingQuote={quote.isRefetchingQuote}
+                  selectedQuote={quote.selectedQuote}
+                />
+                <ProviderFeesRow
+                  isRefetchingQuote={quote.isRefetchingQuote}
+                  selectedQuote={quote.selectedQuote}
+                />
+                <NetworkFeeRow
+                  isRefetchingQuote={quote.isRefetchingQuote}
+                  selectedQuote={quote.selectedQuote}
+                  fromChainName={fromChain.prettyName}
+                />
+                <TotalFeesRow
+                  isRefetchingQuote={quote.isRefetchingQuote}
+                  selectedQuote={quote.selectedQuote}
+                />
+                <ExpectedOutputRow
+                  isRefetchingQuote={quote.isRefetchingQuote}
+                  selectedQuote={quote.selectedQuote}
+                  warnUserOfSlippage={Boolean(quote.warnUserOfSlippage)}
+                />
+              </>
+            )}
+          </DisclosurePanel>
+        </div>
+      )}
+    </Disclosure>
+  );
+};

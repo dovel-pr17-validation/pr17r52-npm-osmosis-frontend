@@ -1,0 +1,60 @@
+export function isFunction(value: any): value is Function {
+  return typeof value === "function";
+}
+
+export function isNumeric(value: any) {
+  return value != null && value - parseFloat(value) + 1 >= 0;
+}
+
+/**
+ * Normalises a typed or pasted amount so a comma decimal separator ("1,5")
+ * becomes a dot ("1.5"). Returns null when the input is ambiguous or malformed
+ * and must be rejected rather than guessed at.
+ *
+ * A single comma with no dot is a decimal separator, except when it follows a
+ * non-zero integer part and is followed by exactly three digits ("1,000",
+ * "12,345"): that reads equally as a thousands separator, so it is rejected.
+ * Multiple commas, or a comma together with a dot ("1,000.5", "1.000,5"), are
+ * rejected. Input without a comma is returned unchanged.
+ */
+export function normalizeDecimalSeparator(input: string): string | null {
+  if (!input.includes(",")) return input;
+  const trimmed = input.trim();
+  if (!/^\d*,\d*$/.test(trimmed)) return null;
+  const [integer, fraction] = trimmed.split(",");
+  if (/^\d{3}$/.test(fraction) && /[1-9]/.test(integer)) return null;
+  return `${integer}.${fraction}`;
+}
+
+export function isValidNumericalRawInput(input: string): boolean {
+  // Normalize whitespace
+  input = input.trim();
+
+  // Allow empty (user hasn't started) and single dot (user started a decimal)
+  if (input === "" || input === ".") return true;
+
+  // Prevent excessively long inputs (reasonable limit for numeric input)
+  if (input.length > 50) return false;
+
+  // Only digits with at most one decimal point, no signs, no exponents
+  // Allows: "0", "10", "0.5", ".5" (handled above), "10.", "1.00"
+  // Rejects: "-", "+", "1..2", "1.2.3", "1e3", "abc"
+  const validPattern = /^\d*\.?\d*$/;
+  if (!validPattern.test(input)) return false;
+
+  // If it's just a dot we would have returned already, so reaching here means:
+  // - string has at least one digit and optional single dot
+  const num = Number(input);
+
+  // Number("") would be 0 but we handled "", and Number(".") is NaN but we handled "."
+  if (Number.isNaN(num)) return false;
+
+  // Non-negative only
+  if (num < 0) return false;
+
+  // Optional cap: disallow values whose integer precision is unsafe.
+  // If you really care about precision, consider checking integer part length instead.
+  if (num > Number.MAX_SAFE_INTEGER) return false;
+
+  return true;
+}

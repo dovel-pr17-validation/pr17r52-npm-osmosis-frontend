@@ -1,0 +1,791 @@
+import {
+  makeExecuteCosmwasmContractMsg,
+  makeIBCTransferMsg,
+} from "@osmosis-labs/tx";
+import { CosmosCounterparty, EVMCounterparty } from "@osmosis-labs/types";
+import { Dec } from "@osmosis-labs/unit";
+import {
+  apiClient,
+  ApiClientError,
+  EthereumChainInfo,
+  getServerEvmRpcTransport,
+  isNil,
+  NativeEVMTokenConstantAddress,
+  redactConfiguredEvmRpcUrls,
+} from "@osmosis-labs/utils";
+import { cachified } from "cachified";
+import Long from "long";
+import {
+  Address,
+  createPublicClient,
+  encodeFunctionData,
+  erc20Abi,
+  numberToHex,
+} from "viem";
+
+import { BridgeQuoteError } from "../errors";
+import {
+  BridgeAsset,
+  BridgeChain,
+  BridgeExternalUrl,
+  BridgeProvider,
+  BridgeProviderContext,
+  BridgeQuote,
+  BridgeSupportedAsset,
+  BridgeTransactionRequest,
+  CosmosBridgeTransactionRequest,
+  EvmBridgeTransactionRequest,
+  GetBridgeExternalUrlParams,
+  GetBridgeQuoteParams,
+  GetBridgeSupportedAssetsParams,
+} from "../interface";
+import { BridgeAssetMap } from "../utils/asset";
+import { SquidProviderId } from "./constants";
+import { getSquidErrors } from "./error";
+import type {
+  SquidChainsResponse,
+  SquidGetRouteParams,
+  SquidRouteResponse,
+  SquidTokensResponse,
+  SquidTransactionRequest,
+} from "./types";
+
+const IbcTransferType = "/ibc.applications.transfer.v1.MsgTransfer";
+const WasmTransferType = "/cosmwasm.wasm.v1.MsgExecuteContract";
+export class SquidBridgeProvider implements BridgeProvider {
+  static readonly ID = SquidProviderId;
+  readonly providerName = SquidBridgeProvider.ID;
+
+  protected readonly apiURL: string;
+  protected readonly squidScanBaseUrl: string;
+
+  constructor(
+    protected readonly integratorId: string,
+    protected readonly ctx: BridgeProviderContext
+  ) {
+    this.apiURL =
+      ctx.env === "mainnet"
+        ? "https://v2.api.squidrouter.com"
+        : "https://testnet.api.squidrouter.com";
+    this.squidScanBaseUrl =
+      ctx.env === "mainnet"
+        ? "https://axelarscan.io"
+        : "https://testnet.axelarscan.io";
+  }
+
+  async getQuote({
+    fromAmount,
+    fromAsset,
+    fromChain,
+    fromAddress,
+    toAddress,
+    toAsset,
+    toChain,
+    slippage = 1,
+  }: GetBridgeQuoteParams): Promise<BridgeQuote> {
+    return cachified({
+      cache: this.ctx.cache,
+      key: JSON.stringify({
+        id: SquidBridgeProvider.ID,
+        fromAmount,
+        fromAsset,
+        fromChain,
+        fromAddress,
+        toAddress,
+        toAsset,
+        toChain,
+        slippage,
+      }),
+      ttl: process.env.NODE_ENV === "test" ? -1 : 20 * 1000, // 20 seconds
+      getFreshValue: async (): Promise<BridgeQuote> => {
+        const getRouteParams: SquidGetRouteParams = {
+          fromChain: fromChain.chainId.toString(),
+          toChain: toChain.chainId.toString(),
+          fromAddress,
+          toAddress,
+          fromAmount,
+          fromToken: fromAsset.address,
+          toToken: toAsset.address,
+          slippage,
+          quoteOnly: false,
+          enableExpress: false,
+          receiveGasOnDestination: false,
+        };
+
+        const url = new URL(`${this.apiURL}/v2/route`);
+        const data = await apiClient<SquidRouteResponse>(url.toString(), {
+          headers: {
+            "x-integrator-id": this.integratorId,
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+          body: JSON.stringify(getRouteParams),
+        }).catch((e) => {
+          if (e instanceof ApiClientError) {
+            const errMsgs = getSquidErrors(e);
+
+            if (
+              errMsgs.errors.some(({ message }) =>
+                message.includes(
+                  "The input amount is not high enough to cover the bridge fee"
+                )
+              )
+            ) {
+              throw new BridgeQuoteError({
+                bridgeId: SquidBridgeProvider.ID,
+                errorType: "InsufficientAmountError",
+                message: e.message,
+              });
+            }
+            if (
+              errMsgs.errors.some(({ message }) =>
+                message.includes(
+                  "No paths found, please choose a different token pair"
+                )
+              )
+            ) {
+              throw new BridgeQuoteError({
+                bridgeId: SquidBridgeProvider.ID,
+                errorType: "NoQuotesError",
+                message: e.message,
+              });
+            }
+          }
+
+          throw e;
+        });
+
+        const {
+          fromAmount: estimateFromAmount,
+          toAmount,
+          feeCosts,
+          estimatedRouteDuration,
+          gasCosts,
+          aggregatePriceImpact,
+          fromAmountUSD,
+          toAmountUSD,
+        } = data.route.estimate;
+
+        if (feeCosts.length > 1 || gasCosts.length > 1) {
+          throw new BridgeQuoteError({
+            bridgeId: SquidBridgeProvider.ID,
+            errorType: "UnsupportedQuoteError",
+            message:
+              "Osmosis FrontEnd only supports a single fee and gas costs",
+          });
+        }
+
+        if (!data.route.transactionRequest) {
+          throw new BridgeQuoteError({
+            bridgeId: SquidBridgeProvider.ID,
+            errorType: "UnsupportedQuoteError",
+            message:
+              "Squid failed to generate a transaction request for this quote",
+          });
+        }
+
+        const transactionRequest = data.route.transactionRequest;
+        const isEvmTransaction = fromChain.chainType === "evm";
+
+        if (!aggregatePriceImpact) {
+          throw new BridgeQuoteError({
+            bridgeId: SquidBridgeProvider.ID,
+            errorType: "UnsupportedQuoteError",
+            message: "Squid failed to generate a price impact for this quote",
+          });
+        }
+
+        if (
+          data?.route?.params?.toToken?.toLowerCase() !==
+          toAsset.address?.toLowerCase()
+        ) {
+          throw new BridgeQuoteError({
+            bridgeId: SquidBridgeProvider.ID,
+            errorType: "UnsupportedQuoteError",
+            message: "toAsset mismatch",
+          });
+        }
+
+        if (
+          isNil(toAmountUSD) ||
+          isNil(fromAmountUSD) ||
+          toAmount === "" ||
+          fromAmountUSD === ""
+        ) {
+          throw new BridgeQuoteError({
+            bridgeId: SquidBridgeProvider.ID,
+            errorType: "UnsupportedQuoteError",
+            message: "USD value not found",
+          });
+        }
+
+        return {
+          input: {
+            ...fromAsset,
+            amount: estimateFromAmount,
+          },
+          expectedOutput: {
+            ...toAsset,
+            amount: toAmount,
+            // Squid reports a loss as a positive percentage; the interface
+            // wants a fraction, negative for a loss.
+            priceImpact: new Dec(aggregatePriceImpact)
+              .quo(new Dec(100))
+              .neg()
+              .toString(),
+          },
+          fromChain,
+          toChain,
+          transferFee:
+            feeCosts.length === 1
+              ? {
+                  denom: feeCosts[0].token.symbol,
+                  amount: feeCosts[0].amount,
+                  chainId: feeCosts[0].token.chainId,
+                  decimals: feeCosts[0].token.decimals,
+                  address: feeCosts[0].token.address,
+                  coinGeckoId: feeCosts[0].token.coingeckoId,
+                  // Squid (Axelar) charges its cross-chain fee on top of the
+                  // input on EVM-source deposits: the tx value is amount + fee.
+                  // Flag it additive so a max-amount input reserves it and the
+                  // affordability check funds input + fee instead of deducting
+                  // it from the input (which fails the wallet signature).
+                  isAdditive: isEvmTransaction,
+                }
+              : {
+                  ...fromAsset,
+                  chainId: fromChain.chainId,
+                  amount: "0",
+                },
+          estimatedTime: estimatedRouteDuration,
+          quoteId: data.route.quoteId,
+          estimatedGasFee:
+            gasCosts.length === 1
+              ? {
+                  denom: gasCosts[0].token.symbol,
+                  amount: gasCosts[0].amount,
+                  decimals: gasCosts[0].token.decimals,
+                  address: gasCosts[0].token.address,
+                  coinGeckoId: gasCosts[0].token.coingeckoId,
+                }
+              : {
+                  ...fromAsset,
+                  amount: "0",
+                },
+          transactionRequest: isEvmTransaction
+            ? await this.createEvmTransaction({
+                fromAsset,
+                fromChain,
+                fromAddress,
+                estimateFromAmount,
+                transactionRequest,
+              })
+            : await this.createCosmosTransaction(
+                transactionRequest.data,
+                fromAddress,
+                toChain,
+                { denom: fromAsset.address, amount: fromAmount }
+                // TODO: uncomment when we're able to find a way to get gas limit from Squid
+                // or get it ourselves
+                // gasCosts.length === 1
+                //   ? {
+                //       gas: gasCosts[0].estimate,
+                //       denom: gasCosts[0].token.address,
+                //       amount: gasCosts[0].amount,
+                //     }
+                //   : undefined
+              ),
+        };
+      },
+    });
+  }
+
+  async getSupportedAssets({
+    chain,
+    asset,
+  }: GetBridgeSupportedAssetsParams): Promise<
+    (BridgeChain & BridgeSupportedAsset)[]
+  > {
+    // Registry fetches live OUTSIDE the try/catch: their failures (registry
+    // down, rate limited) must reject so the client's query retries and
+    // re-polls. Everything below is pure lookup over the fetched data, where
+    // a miss legitimately means "no route for this asset".
+    const [tokens, chains] = await Promise.all([
+      this.getTokens(),
+      this.getChains(),
+    ]);
+    const token = tokens.find(
+      (t) =>
+        (t.address.toLowerCase() === asset.address.toLowerCase() ||
+          t.ibcDenom?.toLowerCase() === asset.address.toLowerCase()) &&
+        // squid uses canonical chain IDs (numerical and string)
+        String(t.chainId) === String(chain.chainId)
+    );
+
+    // Token not in Squid's registry: unsupported by this provider, not an
+    // outage — resolve empty so other transfer options can render.
+    if (!token) return [];
+
+    try {
+      const foundVariants = new BridgeAssetMap<
+        BridgeChain & BridgeSupportedAsset
+      >();
+
+      // asset list counterparties
+      const assetListAsset = this.ctx.assetLists
+        .flatMap(({ assets }) => assets)
+        .find(
+          (a) =>
+            a.coinMinimalDenom.toLowerCase() === asset.address.toLowerCase()
+        );
+
+      for (const counterparty of assetListAsset?.counterparty ?? []) {
+        // check if supported by squid
+        if (!("chainId" in counterparty)) continue;
+        const address =
+          "address" in counterparty
+            ? counterparty.address
+            : counterparty.sourceDenom;
+
+        const squidToken = tokens.find(
+          (t) =>
+            t.address.toLowerCase() === address.toLowerCase() &&
+            String(t.chainId) === String(counterparty.chainId)
+        );
+        if (!squidToken) continue;
+
+        if (counterparty.chainType === "cosmos") {
+          const c = counterparty as CosmosCounterparty;
+
+          foundVariants.setAsset(c.chainId, address, {
+            transferTypes: ["quote"],
+            chainId: c.chainId,
+            chainType: "cosmos",
+            address: address,
+            denom: c.symbol,
+            decimals: c.decimals,
+            coinGeckoId: squidToken.coingeckoId,
+          });
+        }
+        if (counterparty.chainType === "evm") {
+          const c = counterparty as EVMCounterparty;
+
+          foundVariants.setAsset(c.chainId.toString(), address, {
+            transferTypes: ["quote"],
+            chainId: c.chainId,
+            chainType: "evm",
+            address: address,
+            denom: c.symbol,
+            decimals: c.decimals,
+            coinGeckoId: squidToken.coingeckoId,
+          });
+        }
+      }
+
+      // leverage squid's "commonKey" to gather other like source assets for toToken
+      const tokenVariants = tokens
+        .filter(
+          (t) =>
+            t.commonKey &&
+            token.commonKey &&
+            t.commonKey === token.commonKey &&
+            t.address !== token.address &&
+            String(t.chainId) !== String(token.chainId)
+        )
+        .map((t) => {
+          const chain = chains.find(
+            ({ chainId }) => String(chainId) === String(t.chainId)
+          );
+          if (!chain) return;
+          return { ...t, ...chain };
+        })
+        .filter((t): t is NonNullable<typeof t> => !!t);
+
+      for (const variant of tokenVariants) {
+        const chainInfo =
+          variant.chainType === "evm"
+            ? {
+                chainId: variant.chainId as number,
+                chainType: "evm" as const,
+              }
+            : {
+                chainId: variant.chainId as string,
+                chainType: "cosmos" as const,
+              };
+
+        foundVariants.setAsset(variant.chainId.toString(), variant.address, {
+          // squid chain list IDs are canonical
+          ...chainInfo,
+          transferTypes: ["quote"],
+          chainName: variant.chainName,
+          denom: variant.symbol,
+          address: variant.address,
+          decimals: variant.decimals,
+          coinGeckoId: variant.coingeckoId,
+        });
+      }
+
+      return foundVariants.assets;
+    } catch (e) {
+      if (process.env.NODE_ENV !== "production") {
+        console.error(
+          SquidBridgeProvider.ID,
+          "failed to get supported assets:",
+          e
+        );
+      }
+      // Only pure lookup over already-fetched registry data can land here
+      // (infra failures reject above, before the try), so degrade to "no
+      // options from this provider" rather than an error the client would
+      // retry forever.
+      return [];
+    }
+  }
+
+  async createEvmTransaction({
+    fromAsset,
+    fromChain,
+    fromAddress,
+    estimateFromAmount,
+    transactionRequest,
+  }: {
+    fromAsset: BridgeAsset;
+    fromChain: BridgeChain;
+    fromAddress: string;
+    estimateFromAmount: string;
+    transactionRequest: SquidTransactionRequest;
+  }): Promise<EvmBridgeTransactionRequest> {
+    const isFromAssetNative =
+      fromAsset.address === NativeEVMTokenConstantAddress;
+    const squidFromChain = (await this.getChains()).find(
+      ({ chainId }) => String(chainId) === String(fromChain.chainId)
+    );
+
+    if (!squidFromChain) {
+      throw new BridgeQuoteError({
+        bridgeId: SquidBridgeProvider.ID,
+        errorType: "ApprovalTxError",
+        message: "Error getting approval Tx",
+      });
+    }
+
+    let approvalTx: { to: Address; data: string } | undefined;
+    try {
+      const evmChain = EthereumChainInfo.find(
+        ({ id: chainId }) => String(chainId) === String(squidFromChain.chainId)
+      );
+
+      if (!evmChain) {
+        throw new Error("Could not find EVM chain");
+      }
+
+      const fromTokenContract = createPublicClient({
+        chain: evmChain,
+        transport: getServerEvmRpcTransport(evmChain, {
+          timeout: 3_000,
+          retryCount: 0,
+        }),
+      });
+
+      approvalTx = await this.getApprovalTx({
+        fromAddress: fromAddress as Address,
+        fromAmount: estimateFromAmount,
+        fromChain,
+        isFromAssetNative,
+        fromTokenContract,
+        targetAddress: transactionRequest.target as Address,
+        tokenAddress: fromAsset.address as Address,
+      });
+    } catch (e) {
+      throw new BridgeQuoteError({
+        bridgeId: SquidBridgeProvider.ID,
+        errorType: "ApprovalTxError",
+        // viem error text includes the request URL, which for a keyed
+        // provider carries the API key.
+        message: redactConfiguredEvmRpcUrls(`Error creating approval Tx: ${e}`),
+      });
+    }
+
+    return {
+      type: "evm",
+      to: transactionRequest.target as Address,
+      data: transactionRequest.data as Address,
+      value: numberToHex(BigInt(transactionRequest.value)),
+      ...(transactionRequest.maxPriorityFeePerGas
+        ? {
+            gas: numberToHex(BigInt(transactionRequest.gasLimit)),
+            maxFeePerGas: numberToHex(BigInt(transactionRequest.maxFeePerGas)),
+            maxPriorityFeePerGas: numberToHex(
+              BigInt(transactionRequest.maxPriorityFeePerGas)
+            ),
+          }
+        : {
+            gas: numberToHex(BigInt(transactionRequest.gasLimit)),
+            gasPrice: numberToHex(BigInt(transactionRequest.gasPrice)),
+          }),
+      approvalTransactionRequest: approvalTx,
+    };
+  }
+
+  async createCosmosTransaction(
+    data: string,
+    fromAddress: string,
+    toChain: BridgeChain,
+    fromCoin: {
+      denom: string;
+      amount: string;
+    },
+    /** Gas fee from quote */
+    gasFee?: {
+      gas: string;
+      denom: string;
+      amount: string;
+    }
+  ): Promise<CosmosBridgeTransactionRequest> {
+    try {
+      const parsedData = JSON.parse(data) as {
+        typeUrl: typeof IbcTransferType | typeof WasmTransferType;
+      };
+
+      if (parsedData.typeUrl === IbcTransferType) {
+        const ibcData = parsedData as {
+          typeUrl: typeof IbcTransferType;
+          value: {
+            sourcePort: string;
+            sourceChannel: string;
+            token: {
+              denom: string;
+              amount: string;
+            };
+            sender: string;
+            receiver: string;
+            timeoutTimestamp: {
+              low: number;
+              high: number;
+              unsigned: boolean;
+            };
+            memo: string;
+          };
+        };
+
+        // If toChain is not cosmos, this IBC transfer is an
+        // intermediary IBC transfer where we need to get the
+        // timeout from the bech32 prefix of the receiving address
+        const timeoutHeight = await this.ctx.getTimeoutHeight(
+          toChain.chainType === "cosmos"
+            ? toChain
+            : { destinationAddress: ibcData.value.receiver }
+        );
+
+        const { typeUrl, value: msg } = await makeIBCTransferMsg({
+          memo: ibcData.value.memo,
+          receiver: ibcData.value.receiver,
+          sender: ibcData.value.sender,
+          sourceChannel: ibcData.value.sourceChannel,
+          sourcePort: ibcData.value.sourcePort,
+          timeoutTimestamp: new Long(
+            ibcData.value.timeoutTimestamp.low,
+            ibcData.value.timeoutTimestamp.high,
+            ibcData.value.timeoutTimestamp.unsigned
+          ).toString() as any,
+          // @ts-ignore
+          timeoutHeight,
+          token: ibcData.value.token,
+        });
+
+        return {
+          type: "cosmos",
+          msgs: [{ typeUrl, value: msg }],
+          gasFee,
+        };
+      } else if (parsedData.typeUrl === WasmTransferType) {
+        const cosmwasmData = parsedData as {
+          typeUrl: typeof WasmTransferType;
+          value: {
+            sender: string;
+            contract: string;
+            msg: object;
+            funds?: { denom: string; amount: string }[];
+          };
+        };
+
+        const { typeUrl, value: msg } = await makeExecuteCosmwasmContractMsg({
+          sender: fromAddress,
+          contract: cosmwasmData.value.contract,
+          msg: cosmwasmData.value.msg,
+          funds: [fromCoin],
+        });
+
+        return {
+          type: "cosmos",
+          msgs: [{ typeUrl, value: msg }],
+          gasFee,
+        };
+      }
+
+      throw new Error(
+        "Unknown message type. Osmosis FrontEnd only supports the IBC transfer and cosmwasm executeMsg message type"
+      );
+    } catch (e) {
+      const error = e as Error | BridgeQuoteError;
+
+      if (error instanceof Error) {
+        throw new BridgeQuoteError({
+          bridgeId: SquidBridgeProvider.ID,
+          errorType: "CreateCosmosTxError",
+          message: error.message,
+        });
+      }
+
+      throw error;
+    }
+  }
+
+  async getTransactionData(
+    params: GetBridgeQuoteParams
+  ): Promise<BridgeTransactionRequest> {
+    return (await this.getQuote(params)).transactionRequest!;
+  }
+
+  getChains() {
+    return cachified({
+      cache: this.ctx.cache,
+      key: SquidBridgeProvider.ID + "_chains",
+      ttl: process.env.NODE_ENV === "test" ? -1 : 30 * 60 * 1000, // 30 minutes
+      getFreshValue: async () => {
+        try {
+          const data = await apiClient<SquidChainsResponse>(
+            `${this.apiURL}/v2/chains`,
+            {
+              headers: {
+                "x-integrator-id": this.integratorId,
+              },
+            }
+          );
+          return data.chains;
+        } catch (e) {
+          const error = e as ApiClientError;
+          throw error.data;
+        }
+      },
+      // A degraded registry response (e.g. a rate-limited 200 with an empty
+      // body) must not be cached as 30 minutes of truth: an empty registry
+      // reads as "asset unsupported" downstream, which silently bypasses
+      // the client's retry and re-poll machinery. Failing the check makes
+      // cachified throw instead, so it propagates as a provider failure
+      // the client retries. (cachified types the checked value as {}.)
+      checkValue: (value) => {
+        const chains = value as SquidChainsResponse["chains"];
+        return (chains?.length ?? 0) > 0 || "empty Squid chains response";
+      },
+    });
+  }
+
+  getTokens() {
+    return cachified({
+      cache: this.ctx.cache,
+      key: SquidBridgeProvider.ID + "_tokens",
+      ttl: process.env.NODE_ENV === "test" ? -1 : 30 * 60 * 1000, // 30 minutes
+      getFreshValue: async () => {
+        try {
+          const data = await apiClient<SquidTokensResponse>(
+            `${this.apiURL}/v2/tokens`,
+            {
+              headers: {
+                "x-integrator-id": this.integratorId,
+              },
+            }
+          );
+          return data.tokens;
+        } catch (e) {
+          const error = e as ApiClientError;
+          throw error.data;
+        }
+      },
+      // see getChains: never cache a degraded/empty registry response
+      checkValue: (value) => {
+        const tokens = value as SquidTokensResponse["tokens"];
+        return (
+          (tokens?.length ?? 0) > 0 || "empty Squid token registry response"
+        );
+      },
+    });
+  }
+
+  async getApprovalTx({
+    fromTokenContract,
+    fromAmount,
+    isFromAssetNative,
+    fromAddress,
+    targetAddress,
+    tokenAddress,
+  }: {
+    fromTokenContract: ReturnType<typeof createPublicClient>;
+    tokenAddress: Address;
+    isFromAssetNative: boolean;
+    fromAmount: string;
+    fromAddress: Address;
+    fromChain: BridgeChain;
+    /**
+     * The address of the contract that will be called with the approval, in this case, Squid's router contract.
+     */
+    targetAddress: Address;
+  }) {
+    const _sourceAmount = BigInt(fromAmount);
+
+    if (!isFromAssetNative) {
+      const allowance = await fromTokenContract.readContract({
+        abi: erc20Abi,
+        address: tokenAddress,
+        functionName: "allowance",
+        args: [fromAddress, targetAddress],
+      });
+
+      if (_sourceAmount > allowance) {
+        const amountToApprove = _sourceAmount;
+
+        const approveTxData = encodeFunctionData({
+          abi: erc20Abi,
+          functionName: "approve",
+          args: [targetAddress, BigInt(amountToApprove)],
+        });
+
+        return {
+          to: tokenAddress,
+          data: approveTxData,
+        };
+      }
+    }
+  }
+
+  async getExternalUrl({
+    fromChain,
+    toChain,
+    fromAsset,
+    toAsset,
+  }: GetBridgeExternalUrlParams): Promise<BridgeExternalUrl | undefined> {
+    // TODO get axelar ID for both assets
+    const url = new URL(
+      this.ctx.env === "mainnet"
+        ? "https://app.squidrouter.com/"
+        : "https://testnet.app.squidrouter.com/"
+    );
+    const chains = [fromChain?.chainId, toChain?.chainId]
+      .filter(Boolean)
+      .join(",");
+    const tokens = [fromAsset?.address, toAsset?.address]
+      .filter(Boolean)
+      .join(",");
+
+    if (chains) {
+      url.searchParams.set("chains", chains);
+    }
+    if (tokens) {
+      url.searchParams.set("tokens", tokens);
+    }
+
+    return { urlProviderName: "Squid", url };
+  }
+}
+
+export * from "./transfer-status";

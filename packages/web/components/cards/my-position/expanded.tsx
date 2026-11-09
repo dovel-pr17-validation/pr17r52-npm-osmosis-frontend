@@ -1,0 +1,758 @@
+import type {
+  PositionHistoricalPerformance,
+  UserPosition,
+  UserPositionDetails,
+} from "@osmosis-labs/server";
+import {
+  prepareBeginUnlockingMsgOrSuperfluidUnbondLockMsgIfSyntheticLock,
+  prepareCollectAllPositionsRewardsMsgs,
+  prepareStakeExistingPositionMsg,
+} from "@osmosis-labs/tx";
+import { CoinPretty, Dec, PricePretty } from "@osmosis-labs/unit";
+import classNames from "classnames";
+import moment from "dayjs";
+import dynamic from "next/dynamic";
+import Image from "next/image";
+import { useRouter } from "next/router";
+import React, {
+  ComponentProps,
+  FunctionComponent,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+
+import { FallbackImg } from "~/components/assets";
+import { ChartUnavailable, PriceChartHeader } from "~/components/chart";
+import { Spinner } from "~/components/loaders";
+import { Tooltip } from "~/components/tooltip";
+import { CustomClasses } from "~/components/types";
+import { ArrowButton, Button, ChartButton } from "~/components/ui/button";
+import { EntityImage } from "~/components/ui/entity-image";
+import { useTranslation } from "~/hooks";
+import {
+  type HistoricalAndLiquidityData,
+  useHistoricalAndLiquidityData,
+  useHoverPrice,
+} from "~/hooks/ui-config/use-historical-and-depth-data";
+import { useConst } from "~/hooks/use-const";
+import { usePositionMigrationForPosition } from "~/hooks/use-position-migration-for-position";
+import { useWallet } from "~/hooks/use-wallet";
+import { SuperfluidValidatorModal } from "~/modals";
+import { IncreaseConcentratedLiquidityModal } from "~/modals/increase-concentrated-liquidity";
+import { MigrateConcentratedPositionModal } from "~/modals/migrate-concentrated-position";
+import { RemoveConcentratedLiquidityModal } from "~/modals/remove-concentrated-liquidity";
+import {
+  formatPretty,
+  formatPriceWithUserPrecision,
+  getFullPrecisionPrice,
+  getPriceExtendedFormatOptions,
+} from "~/utils/formatter";
+import { getLogoURIs } from "~/utils/logo-uri";
+import { RouterOutputs } from "~/utils/trpc";
+
+const ConcentratedLiquidityDepthChart = dynamic(
+  () =>
+    import("~/components/chart/concentrated-liquidity-depth").then(
+      (module) => module.ConcentratedLiquidityDepthChart
+    ),
+  { ssr: false }
+);
+const HistoricalPriceChart = dynamic(
+  () =>
+    import("~/components/chart/price-historical").then(
+      (module) => module.HistoricalPriceChart
+    ),
+  { ssr: false }
+);
+
+export const MyPositionCardExpandedSection: FunctionComponent<{
+  poolId: string;
+  position: UserPosition;
+  positionDetails: UserPositionDetails | undefined;
+  positionPerformance: PositionHistoricalPerformance | undefined;
+  showLinkToPool?: boolean;
+  isLoadingPositionDetails: boolean;
+  hasPositionDetailsError: boolean;
+}> = memo(
+  ({
+    poolId,
+    position,
+    showLinkToPool = false,
+    positionDetails,
+    positionPerformance,
+    isLoadingPositionDetails,
+    hasPositionDetailsError,
+  }) => {
+    const {
+      wallet: account,
+      txTypeInProgress,
+      signAndBroadcast,
+      transactionContext,
+    } = useWallet();
+
+    const {
+      position: rawPosition,
+      priceRange: [lowerPrice, upperPrice],
+      isFullRange,
+      currentCoins,
+      currentValue,
+    } = position;
+
+    const {
+      currentPrice,
+      status,
+      unbondEndTime,
+      isPoolSuperfluid,
+      superfluidApr,
+      superfluidData,
+      isUnbonding,
+      isSuperfluidStaked,
+      isSuperfluidUnstaking,
+    } = positionDetails ?? {};
+
+    const {
+      claimableRewardCoins,
+      claimableRewardsValue,
+      principalCoins,
+      principalValue,
+      totalRewardCoins,
+      totalEarnedValue,
+    } = positionPerformance ?? {};
+    // Performance comes from the data services. While it's unavailable the rewards are
+    // unknown, so the reward panels stay blank instead of saying there are none.
+
+    const { t } = useTranslation();
+    const router = useRouter();
+
+    const [activeModal, setActiveModal] = useState<
+      "increase" | "remove" | "migrate" | null
+    >(null);
+
+    // Offered only for positions the fe-content map pairs with a
+    // spread-matched destination pool, and only when that pairing still holds
+    // against live pool state. An absent map means the action never appears.
+    const {
+      migration: eligibleMigration,
+      mappedMigration,
+      eligibility: migrationEligibility,
+      minAmountTolerance,
+      revalidate: revalidateMigration,
+      isPoolDataRefetching,
+    } = usePositionMigrationForPosition({
+      poolId,
+      positionId: position.position.position.position_id,
+      // The divergence gate tightens with position size, so it needs the
+      // value being moved, not just the pool. A zero here (which includes a
+      // broken price pipeline) gates at the strictest tier downstream.
+      positionValueUsd: Number(currentValue?.toDec().toString() ?? "0"),
+      // Both sides and both ticks are checked: out-of-range (single-sided)
+      // positions and literal zero ticks are refused at eligibility rather
+      // than failing after the sizing simulations.
+      positionAmounts: {
+        amount0: position.position.asset0.amount,
+        amount1: position.position.asset1.amount,
+      },
+      positionTicks: {
+        lowerTick: position.position.position.lower_tick,
+        upperTick: position.position.position.upper_tick,
+      },
+      // Missing or errored details must read as locked, never as unlocked.
+      lockStateKnown: positionDetails !== undefined && !hasPositionDetailsError,
+      isUnbonding: Boolean(isUnbonding),
+      isSuperfluidStaked: Boolean(isSuperfluidStaked),
+      isSuperfluidUnstaking: Boolean(isSuperfluidUnstaking),
+    });
+
+    // Unconditional: this component's hook count must not depend on the
+    // asynchronous eligibility result.
+    const openMigrateModal = useCallback(() => setActiveModal("migrate"), []);
+
+    const chartConfig = useHistoricalAndLiquidityData(poolId);
+    const {
+      xRange,
+      yRange,
+      depthChartData,
+      resetZoom,
+      zoomIn,
+      zoomOut,
+      setPriceRange,
+    } = chartConfig;
+
+    const [selectSfValidatorAddress, setSelectSfValidatorAddress] =
+      useState<boolean>(false);
+
+    useEffect(() => {
+      if (lowerPrice && upperPrice) {
+        setPriceRange([lowerPrice, upperPrice]);
+      }
+    }, [lowerPrice, upperPrice, setPriceRange]);
+
+    const sendCollectAllRewardsMsg = useCallback(() => {
+      const hasSpreadRewards = rawPosition.claimable_spread_rewards.length > 0;
+      const hasIncentiveRewards = rawPosition.claimable_incentives.length > 0;
+      prepareCollectAllPositionsRewardsMsgs(
+        transactionContext,
+        hasSpreadRewards ? [rawPosition.position.position_id] : [],
+        hasIncentiveRewards ? [rawPosition.position.position_id] : [],
+        undefined
+      )
+        .then((prepared) => signAndBroadcast(...prepared))
+        .catch(console.error);
+    }, [
+      rawPosition.claimable_incentives.length,
+      rawPosition.claimable_spread_rewards.length,
+      rawPosition.position.position_id,
+      signAndBroadcast,
+      transactionContext,
+    ]);
+
+    return (
+      <div className="flex flex-col gap-4" onClick={(e) => e.stopPropagation()}>
+        <div className="flex w-full gap-1 xl:hidden">
+          <div className="flex h-[20.1875rem] w-full flex-col gap-[20px] rounded-l-2xl bg-osmoverse-700 py-7 pl-6">
+            {chartConfig.isHistoricalDataLoading ? (
+              <Spinner className="m-auto" />
+            ) : !chartConfig.historicalChartUnavailable ? (
+              <>
+                <ChartHeader config={chartConfig} />
+                <Chart config={chartConfig} position={position} />
+              </>
+            ) : (
+              <ChartUnavailable />
+            )}
+          </div>
+          <div className="flex h-[20.1875rem] w-80 rounded-r-2xl bg-osmoverse-700">
+            <div className="mt-[84px] flex flex-1 flex-col">
+              <ConcentratedLiquidityDepthChart
+                yRange={yRange}
+                xRange={xRange}
+                data={depthChartData}
+                annotationDatum={useMemo(
+                  () => ({
+                    price: Number(currentPrice?.toString()),
+                    depth: xRange[1],
+                  }),
+                  [currentPrice, xRange]
+                )}
+                rangeAnnotation={useMemo(
+                  () => [
+                    {
+                      price: Number(lowerPrice.toString()),
+                      depth: xRange[1],
+                    },
+                    {
+                      price: Number(upperPrice.toString()),
+                      depth: xRange[1],
+                    },
+                  ],
+                  [lowerPrice, upperPrice, xRange]
+                )}
+                offset={useConst({
+                  top: 0,
+                  right: 36,
+                  bottom: 24 + 28,
+                  left: 0,
+                })}
+                horizontal
+                fullRange={isFullRange}
+              />
+            </div>
+            <div className="mb-8 flex flex-col pr-2">
+              <div className="mr-6 mt-7 flex h-6 gap-1">
+                <ChartButton
+                  alt="refresh"
+                  icon="refresh-ccw"
+                  selected={false}
+                  onClick={() => resetZoom()}
+                />
+                <ChartButton
+                  alt="zoom out"
+                  icon="zoom-out"
+                  selected={false}
+                  onClick={zoomOut}
+                />
+                <ChartButton
+                  alt="zoom in"
+                  icon="zoom-in"
+                  selected={false}
+                  onClick={zoomIn}
+                />
+              </div>
+              <div className="flex h-full flex-col justify-between py-4">
+                <PriceBox
+                  currentValue={formatPriceWithUserPrecision(upperPrice)}
+                  fullPrecisionValue={getFullPrecisionPrice(upperPrice)}
+                  label={t("clPositions.maxPrice")}
+                  infinity={isFullRange}
+                />
+                <PriceBox
+                  currentValue={
+                    isFullRange ? "0" : formatPriceWithUserPrecision(lowerPrice)
+                  }
+                  fullPrecisionValue={getFullPrecisionPrice(lowerPrice)}
+                  label={t("clPositions.minPrice")}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+        <div className="flex w-full flex-col gap-4 sm:flex-col">
+          <div className="flex flex-wrap justify-between gap-3 sm:flex-col">
+            <AssetsInfo
+              className="flex-1 sm:w-full"
+              title={t("clPositions.currentAssets")}
+              assets={currentCoins}
+              totalValue={currentValue}
+            />
+            <AssetsInfo
+              className="flex-1 sm:w-full"
+              title={t("clPositions.totalRewardsEarned")}
+              assets={totalRewardCoins}
+              totalValue={totalEarnedValue}
+              emptyText={
+                positionPerformance ? t("clPositions.noRewards") : undefined
+              }
+            />
+          </div>
+          <div className="flex flex-wrap justify-between gap-3 sm:flex-col">
+            {(principalCoins?.length ?? 0) < 1 &&
+            positionPerformance ? undefined : (
+              <AssetsInfo
+                className="flex-1 sm:w-full"
+                title={t("clPositions.principalAssets")}
+                assets={principalCoins}
+                totalValue={principalValue}
+              />
+            )}
+            <AssetsInfo
+              className="flex-1 sm:w-full"
+              title={t("clPositions.unclaimedRewards")}
+              assets={claimableRewardCoins}
+              totalValue={claimableRewardsValue}
+              emptyText={
+                positionPerformance ? t("clPositions.noRewards") : undefined
+              }
+            />
+          </div>
+          {unbondEndTime && !superfluidData && (
+            <div className="flex flex-wrap justify-between gap-3 sm:flex-col">
+              <div className="flex flex-col text-right md:pl-4">
+                <span>
+                  {t("clPositions.unbondingFromNow", {
+                    fromNow: moment(unbondEndTime).fromNow(true),
+                  })}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+        {superfluidData && <SuperfluidPositionInfo {...superfluidData} />}
+        <div className="mt-4 flex flex-row flex-wrap justify-end gap-5 sm:flex-wrap sm:justify-start">
+          {showLinkToPool && (
+            <ArrowButton
+              className="md:ml-auto"
+              onClick={() => router.push(`/pool/${poolId}`)}
+            >
+              {t("clPositions.goToPool", { poolId })}
+            </ArrowButton>
+          )}
+          {isFullRange &&
+            isPoolSuperfluid &&
+            !superfluidData &&
+            superfluidApr &&
+            account &&
+            status !== "unbonding" && (
+              <>
+                <button
+                  className="w-fit rounded-[10px] bg-superfluid px-[2px] py-[2px] md:ml-auto"
+                  onClick={() => {
+                    setSelectSfValidatorAddress(true);
+                  }}
+                >
+                  <div className="w-full rounded-[9px] bg-osmoverse-800 px-3 py-[6px] md:px-2">
+                    <span className="text-superfluid-gradient">
+                      {t("pool.superfluidEarnMore", {
+                        rate: superfluidApr.maxDecimals(1).toString(),
+                      })}
+                    </span>
+                  </div>
+                </button>
+                {selectSfValidatorAddress && (
+                  <SuperfluidValidatorModal
+                    isOpen={selectSfValidatorAddress}
+                    onRequestClose={() => setSelectSfValidatorAddress(false)}
+                    onSelectValidator={(validatorAddress) => {
+                      prepareStakeExistingPositionMsg(
+                        transactionContext,
+                        position.id,
+                        validatorAddress
+                      )
+                        .then((prepared) => signAndBroadcast(...prepared))
+                        .catch(console.error);
+                      setSelectSfValidatorAddress(false);
+                    }}
+                  />
+                )}
+              </>
+            )}
+          <PositionButton
+            disabled={
+              claimableRewardCoins?.length === 0 ||
+              Boolean(txTypeInProgress) ||
+              !Boolean(account)
+            }
+            onClick={sendCollectAllRewardsMsg}
+          >
+            {t("clPositions.collectRewards")}
+          </PositionButton>
+          <Tooltip
+            disabled={!hasPositionDetailsError}
+            className="cursor-default"
+            content={t("clPositions.errorFetchingPositions")}
+          >
+            <PositionButton
+              disabled={
+                !status ||
+                Boolean(txTypeInProgress) ||
+                Boolean(superfluidData?.undelegationEndTime) ||
+                status === "unbonding" ||
+                !Boolean(account)
+              }
+              onClick={() => {
+                if (superfluidData?.delegationLockId) {
+                  prepareBeginUnlockingMsgOrSuperfluidUnbondLockMsgIfSyntheticLock(
+                    transactionContext,
+                    [
+                      {
+                        lockId: superfluidData.delegationLockId,
+                        isSynthetic: true,
+                      },
+                    ]
+                  )
+                    .then((prepared) => signAndBroadcast(...prepared))
+                    .catch(console.error);
+                } else setActiveModal("remove");
+              }}
+              isLoading={isLoadingPositionDetails}
+            >
+              {Boolean(superfluidData?.delegationLockId)
+                ? t("clPositions.unstake")
+                : t("clPositions.removeLiquidity")}
+            </PositionButton>
+          </Tooltip>
+          <Tooltip
+            disabled={!hasPositionDetailsError}
+            className="cursor-default"
+            content={t("clPositions.errorFetchingPositions")}
+          >
+            <PositionButton
+              disabled={
+                !status ||
+                Boolean(txTypeInProgress) ||
+                Boolean(superfluidData?.undelegationEndTime) ||
+                status === "unbonding"
+              }
+              onClick={() => setActiveModal("increase")}
+              isLoading={isLoadingPositionDetails}
+            >
+              {t("clPositions.increaseLiquidity")}
+            </PositionButton>
+          </Tooltip>
+
+          {eligibleMigration && (
+            <PositionButton
+              variant="default"
+              // Also held while the polled pool data is mid-refetch, so the
+              // action cannot be taken on an eligibility that is about to
+              // change.
+              disabled={
+                Boolean(txTypeInProgress) ||
+                !Boolean(account) ||
+                isPoolDataRefetching
+              }
+              onClick={openMigrateModal}
+              isLoading={isLoadingPositionDetails}
+            >
+              {t("clPositions.migrateLiquidity")}
+            </PositionButton>
+          )}
+
+          {activeModal === "increase" && !!status && (
+            <IncreaseConcentratedLiquidityModal
+              isOpen={true}
+              poolId={poolId}
+              position={position}
+              status={status}
+              onRequestClose={() => setActiveModal(null)}
+            />
+          )}
+          {/* Mounted on the map entry, not on live eligibility: the pool data
+              polls, and a divergence drifting out of tolerance must disable
+              the confirm inside the open modal rather than unmount it under
+              the user - potentially mid-signing. Only the reasons that carry
+              a divergence keep it mounted (eligible, or priceDivergence);
+              anything else - the map entry pulled, config broken - is the
+              kill switch and rightly closes it. */}
+          {activeModal === "migrate" &&
+            mappedMigration &&
+            migrationEligibility?.divergencePercent !== undefined &&
+            migrationEligibility.appliedTolerancePercent !== undefined &&
+            minAmountTolerance !== undefined && (
+              <MigrateConcentratedPositionModal
+                isOpen={true}
+                position={position}
+                toPoolId={mappedMigration.toPoolId.toString()}
+                divergencePercent={migrationEligibility.divergencePercent}
+                appliedTolerancePercent={
+                  migrationEligibility.appliedTolerancePercent
+                }
+                isEligible={migrationEligibility.isEligible}
+                isPoolDataRefetching={isPoolDataRefetching}
+                revalidate={revalidateMigration}
+                onRequestClose={() => setActiveModal(null)}
+              />
+            )}
+          {activeModal === "remove" && !!status && claimableRewardCoins && (
+            <RemoveConcentratedLiquidityModal
+              isOpen={true}
+              poolId={poolId}
+              position={position}
+              onRequestClose={() => setActiveModal(null)}
+              claimableRewardCoins={claimableRewardCoins}
+              status={status}
+            />
+          )}
+        </div>
+      </div>
+    );
+  }
+);
+
+const PositionButton: FunctionComponent<ComponentProps<typeof Button>> = (
+  props
+) => {
+  return (
+    <Button size="md" variant="outline" onClick={props.onClick} {...props}>
+      {props.children}
+    </Button>
+  );
+};
+
+export const AssetsInfo: FunctionComponent<
+  {
+    title: string;
+    assets?: CoinPretty[];
+    /** Undefined when the assets couldn't be priced; shown as unknown, not hidden. */
+    totalValue?: PricePretty;
+    emptyText?: string;
+  } & CustomClasses
+> = ({ className, title, assets = [], totalValue, emptyText }) => {
+  const { t } = useTranslation();
+
+  return (
+    <div
+      className={classNames(
+        "subtitle1 flex flex-col gap-2 text-osmoverse-400",
+        className
+      )}
+    >
+      <div>{title}</div>
+      {assets.length > 0 ? (
+        <div className="flex flex-wrap gap-3">
+          <div className="flex gap-2">
+            <div className="flex flex-wrap gap-x-5 gap-y-3">
+              {assets.map((asset) => (
+                <div key={asset.denom} className="flex items-center gap-2">
+                  <div className="h-[24px] w-[24px] flex-shrink-0 overflow-hidden rounded-full">
+                    <EntityImage
+                      logoURIs={getLogoURIs(asset.currency.coinImageUrl)}
+                      name={asset.currency.coinDenom}
+                      symbol={asset.currency.coinDenom}
+                      height={24}
+                      width={24}
+                    />
+                  </div>
+                  <span className="whitespace-nowrap">
+                    {formatPretty(asset, { maxDecimals: 6 })}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="text-white-full">
+              ({totalValue?.toString() ?? "–"})
+            </div>
+          </div>
+        </div>
+      ) : emptyText ? (
+        <span className="italic">{t("clPositions.checkBackForRewards")}</span>
+      ) : null}
+    </div>
+  );
+};
+
+const PriceBox: FunctionComponent<{
+  label: string;
+  currentValue: string;
+  fullPrecisionValue?: string;
+  infinity?: boolean;
+}> = ({ label, currentValue, fullPrecisionValue, infinity }) => (
+  <div className="flex w-full max-w-[9.75rem] flex-col gap-1">
+    <span className="pt-2 text-caption text-osmoverse-400">{label}</span>
+    {infinity ? (
+      <div className="flex items-center">
+        <Image
+          alt="infinity"
+          src="/icons/infinity.svg"
+          width={16}
+          height={16}
+        />
+      </div>
+    ) : (
+      <h6
+        className="overflow-hidden text-ellipsis border-0 bg-transparent text-subtitle1 leading-tight"
+        title={fullPrecisionValue}
+      >
+        {currentValue}
+      </h6>
+    )}
+  </div>
+);
+
+/**
+ * Create a nested component to prevent unnecessary re-renders whenever the hover price changes.
+ */
+const ChartHeader: FunctionComponent<{
+  config: HistoricalAndLiquidityData;
+}> = ({ config }) => {
+  const {
+    historicalRange,
+    priceDecimal,
+    setHistoricalRange,
+    baseDenom,
+    quoteDenom,
+  } = config;
+  const hoverPrice = useHoverPrice(config);
+
+  const formatOpts = useMemo(
+    () => getPriceExtendedFormatOptions(new Dec(hoverPrice)),
+    [hoverPrice]
+  );
+
+  return (
+    <PriceChartHeader
+      formatOpts={formatOpts}
+      historicalRange={historicalRange}
+      setHistoricalRange={setHistoricalRange}
+      baseDenom={baseDenom}
+      quoteDenom={quoteDenom}
+      hoverPrice={hoverPrice}
+      decimal={priceDecimal}
+    />
+  );
+};
+
+/**
+ * Create a nested component to prevent unnecessary re-renders whenever the hover price changes.
+ */
+const Chart: FunctionComponent<{
+  config: HistoricalAndLiquidityData;
+  position: UserPosition;
+}> = ({ config, position: { isFullRange } }) => {
+  const {
+    historicalChartData,
+    yRange,
+    setHoverPrice,
+    lastChartData,
+    range,
+    currentPrice,
+  } = config;
+
+  return (
+    <HistoricalPriceChart
+      data={historicalChartData}
+      annotations={
+        isFullRange
+          ? [new Dec((yRange[0] || 0) * 1.05), new Dec((yRange[1] || 0) * 0.95)]
+          : range || []
+      }
+      domain={yRange}
+      onPointerHover={(price) => setHoverPrice(price)}
+      onPointerOut={
+        lastChartData
+          ? () => setHoverPrice(Number(currentPrice.toString()))
+          : undefined
+      }
+    />
+  );
+};
+
+const SuperfluidPositionInfo: FunctionComponent<
+  NonNullable<
+    RouterOutputs["local"]["concentratedLiquidity"]["getPositionDetails"]["superfluidData"]
+  >
+> = (props) => {
+  const {
+    validatorName,
+    validatorImgSrc,
+    equivalentStakedAmount,
+    validatorCommission,
+    superfluidApr,
+    humanizedStakeDuration,
+  } = props;
+  const { t } = useTranslation();
+
+  /** is undelegation */
+  const endTime = props.undelegationEndTime;
+
+  return (
+    <div className="subtitle1 flex w-full flex-col gap-4 md:gap-1">
+      <span className="text-osmoverse-400">
+        {t("clPositions.superfluidValidator")}
+      </span>
+      <div className="flex items-center gap-3">
+        <FallbackImg // don't use next/image because we may not know what origin the image is on, next.config.js requires listed origins
+          className="rounded-full"
+          src={validatorImgSrc}
+          fallbacksrc="/icons/profile.svg"
+          height={50}
+          width={50}
+        />
+        <div className="md:caption flex flex-col">
+          <span>{validatorName}</span>
+          <span>~{equivalentStakedAmount.trim(true).toString()}</span>
+        </div>
+        <div className="md:caption flex flex-col pl-8 text-right md:pl-4">
+          <span className="text-superfluid-gradient">
+            +{superfluidApr.maxDecimals(2).toString()} {t("pool.APR")}
+          </span>
+          {validatorCommission && (
+            <span>
+              {validatorCommission?.toString()}{" "}
+              {t("clPositions.superfluidCommission")}
+            </span>
+          )}
+        </div>
+        <div className="md:caption flex flex-col pl-8 text-right md:pl-4">
+          {endTime ? (
+            <span>
+              {t("clPositions.superfluidUnstaking", {
+                fromNow: moment(endTime).fromNow(true),
+              })}
+            </span>
+          ) : (
+            <span>
+              {t("clPositions.superfluidUnstake", {
+                duration: humanizedStakeDuration ?? "",
+              })}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};

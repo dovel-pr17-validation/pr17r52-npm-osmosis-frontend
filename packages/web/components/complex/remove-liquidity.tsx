@@ -1,0 +1,134 @@
+import { CoinPretty, Dec, PricePretty } from "@osmosis-labs/unit";
+import classNames from "classnames";
+import { FunctionComponent, ReactNode } from "react";
+
+import { CustomClasses } from "~/components/types";
+import { Button } from "~/components/ui/button";
+import { EntityImage } from "~/components/ui/entity-image";
+import { Slider } from "~/components/ui/slider";
+import { useTranslation } from "~/hooks";
+
+/** Liquidity to be removed. */
+export type RemovableShareLiquidity = {
+  /** Undefined when the shares can't be priced; removing them still works. */
+  shareValue?: PricePretty;
+  shares: CoinPretty;
+  underlyingCoins: CoinPretty[];
+};
+
+export const RemoveLiquidity: FunctionComponent<
+  {
+    /** Raw percentage as integer. e.g. `50` => 50% */
+    percentage: string;
+    setPercentage: (percentage: string) => void;
+    actionButton: ReactNode;
+  } & RemovableShareLiquidity &
+    CustomClasses
+> = ({
+  percentage,
+  setPercentage,
+  className,
+  shareValue,
+  shares,
+  underlyingCoins,
+  actionButton,
+}) => {
+  const { t } = useTranslation();
+
+  const percentageMultiplier = new Dec(percentage).quo(new Dec(100));
+  const removableValueWithPercentage = shareValue?.mul(percentageMultiplier);
+  const removableSharesWithPercentage = shares.mul(percentageMultiplier);
+
+  return (
+    <>
+      <div
+        className={classNames(
+          "mx-auto flex w-[420px] flex-col gap-9 text-center md:w-full md:gap-5",
+          className
+        )}
+      >
+        <div className="flex flex-col gap-1">
+          <h2 className="mt-12 md:mt-7">
+            {removableValueWithPercentage?.toString() ?? "–"}
+          </h2>
+          <h5 className="text-osmoverse-100 md:text-h6 md:font-h6">
+            {t("removeLiquidity.sharesAmount", {
+              shares: removableSharesWithPercentage
+                .trim(true)
+                .hideDenom(true)
+                .toString(),
+            })}
+          </h5>
+        </div>
+        <div className="flex flex-wrap place-content-around items-center gap-4 rounded-xl border border-osmoverse-600 px-3 py-2 text-osmoverse-300">
+          {underlyingCoins.map((asset) => (
+            <div
+              className="flex items-center gap-2"
+              key={asset.currency.coinDenom}
+            >
+              <div className="h-4 w-4 shrink-0 overflow-hidden rounded-full">
+                <EntityImage
+                  logoURIs={{
+                    png: asset.currency.coinImageUrl,
+                  }}
+                  name={asset.currency.coinDenom}
+                  symbol={asset.currency.coinDenom}
+                  height={16}
+                  width={16}
+                />
+              </div>
+              <span className="max-w-xs truncate">
+                {asset.mul(percentageMultiplier).trim(true).toString()}
+              </span>
+            </div>
+          ))}
+        </div>
+        <Slider
+          className="my-8 w-full"
+          value={[parseInt(percentage)]}
+          onValueChange={(value: number[]) =>
+            setPercentage(value[0].toString())
+          }
+          min={0}
+          max={100}
+          step={1}
+        />
+        <div className="mb-14 grid h-9 w-full grid-cols-4 gap-5 md:mb-6 md:gap-1">
+          <Button
+            className="!h-full"
+            size="sm"
+            onClick={() => setPercentage("25")}
+            disabled={shares.toDec().isZero()}
+          >
+            25%
+          </Button>
+          <Button
+            className="!h-full"
+            size="sm"
+            onClick={() => setPercentage("50")}
+            disabled={shares.toDec().isZero()}
+          >
+            50%
+          </Button>
+          <Button
+            className="!h-full"
+            size="sm"
+            onClick={() => setPercentage("75")}
+            disabled={shares.toDec().isZero()}
+          >
+            75%
+          </Button>
+          <Button
+            className="!h-full"
+            size="sm"
+            onClick={() => setPercentage("100")}
+            disabled={shares.toDec().isZero()}
+          >
+            {t("components.MAX")}
+          </Button>
+        </div>
+      </div>
+      {actionButton}
+    </>
+  );
+};

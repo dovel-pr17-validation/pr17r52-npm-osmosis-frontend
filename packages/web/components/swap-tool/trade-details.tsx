@@ -1,0 +1,556 @@
+import { Disclosure } from "@headlessui/react";
+import { DEFAULT_VS_CURRENCY } from "@osmosis-labs/server";
+import { Dec, PricePretty, RatePretty } from "@osmosis-labs/unit";
+import { EmptyAmountError } from "@osmosis-labs/utils";
+import classNames from "classnames";
+import { memo, useEffect, useMemo, useState } from "react";
+import { useMeasure } from "react-use";
+
+import { Icon } from "~/components/assets/icon";
+import { SkeletonLoader, Spinner } from "~/components/loaders";
+import { priceImpactLoss } from "~/components/loss-acknowledgement";
+import { RouteLane } from "~/components/swap-tool/split-route";
+import { getShouldHideSlippage } from "~/components/swap-tool/utils";
+import { GenericDisclaimer } from "~/components/tooltip/generic-disclaimer";
+import { RecapRow } from "~/components/ui/recap-row";
+import { HighPriceImpactGate } from "~/config/trade-warnings";
+import {
+  useDisclosure,
+  UseDisclosureReturn,
+  useLatestWhen,
+  useSlippageConfig,
+  useTranslation,
+} from "~/hooks";
+import { useSwap } from "~/hooks/use-swap";
+import { formatPretty, getPriceExtendedFormatOptions } from "~/utils/formatter";
+import { RouterOutputs } from "~/utils/trpc";
+
+interface TradeDetailsProps {
+  swapState: ReturnType<typeof useSwap>;
+  slippageConfig: ReturnType<typeof useSlippageConfig>;
+  type: "limit" | "market";
+  inPriceFetching?: boolean;
+  treatAsStable?: string;
+  makerFee?: Dec;
+  priceOverride?: PricePretty;
+  tab?: "buy" | "sell";
+}
+
+export const TradeDetails = memo(
+  ({
+    swapState,
+    inPriceFetching,
+    treatAsStable,
+    type,
+    makerFee,
+    tab,
+    priceOverride,
+  }: Partial<TradeDetailsProps>) => {
+    const { t } = useTranslation();
+    const routesVisDisclosure = useDisclosure();
+
+    const [outAsBase, setOutAsBase] = useState(tab === "buy");
+
+    const [details, { height: detailsHeight }] = useMeasure<HTMLDivElement>();
+
+    const isInAmountEmpty =
+      swapState?.inAmountInput.error instanceof EmptyAmountError;
+    const isOutAmountEmpty =
+      swapState?.outAmountInput.error instanceof EmptyAmountError;
+
+    const isLoading =
+      type === "market" &&
+      swapState?.isQuoteLoading &&
+      !Boolean(swapState?.error);
+
+    const priceImpact = swapState?.quote?.priceImpactTokenOut;
+
+    // Same constant and same comparison as the acknowledgement gate, so the red
+    // icon and the checkbox can never disagree about what counts as high impact
+    // — including at the boundary, which a `lt(gate.neg())` form would get
+    // wrong by one tick.
+    const priceImpactUnknown = Boolean(swapState?.quote?.priceImpactUnknown);
+    const isPriceImpactHigh = useMemo(
+      () =>
+        priceImpactUnknown ||
+        (priceImpact
+          ? priceImpactLoss(priceImpact.toDec()).gte(HighPriceImpactGate)
+          : undefined),
+      [priceImpact, priceImpactUnknown]
+    );
+
+    // Green is reserved for an impact genuinely in the user's favour. A
+    // negative impact under the gate is neutral, not green: colouring a loss
+    // the same as a gain reads as an endorsement of it, and did so directly
+    // beneath a rust output-difference figure describing the same trade.
+    const isPriceImpactPositive = priceImpact?.toDec().isPositive() ?? false;
+
+    const limitTotalFees = useMemo(() => {
+      if (!makerFee || makerFee.isZero()) return;
+      return formatPretty((makerFee ?? new Dec(0)).mul(new Dec(100)), {
+        maxDecimals: 2,
+        minimumFractionDigits: 2,
+      });
+    }, [makerFee]);
+
+    return (
+      <div className="flex w-full">
+        <Disclosure>
+          {({ open, close }) => (
+            <div
+              className="flex w-full flex-col transition-all"
+              style={{
+                height: open ? detailsHeight : 32,
+                overflow: open ? "hidden" : undefined,
+              }}
+            >
+              <div ref={details} className="flex w-full flex-col">
+                <Closer
+                  isInAmountEmpty={isInAmountEmpty || isOutAmountEmpty}
+                  close={close}
+                />
+                <div className="flex min-h-[2rem] w-full items-start justify-between sm:min-h-[1.5rem]">
+                  <SkeletonLoader
+                    isLoaded={Boolean(swapState?.inBaseOutQuoteSpotPrice)}
+                  >
+                    <GenericDisclaimer
+                      title={t("tradeDetails.expectedRate.header")}
+                      body={t("tradeDetails.expectedRate.content")}
+                    >
+                      <div className="flex items-center gap-2">
+                        {isLoading && (
+                          <Spinner className="!h-6 !w-6 text-wosmongton-500" />
+                        )}
+                        <span
+                          onClick={() => setOutAsBase(!outAsBase)}
+                          className={classNames(
+                            "body2 sm:caption py-1 text-osmoverse-300",
+                            {
+                              "animate-pulse":
+                                inPriceFetching ||
+                                isLoading ||
+                                swapState?.inAmountInput.isTyping ||
+                                swapState?.outAmountInput.isTyping,
+                            }
+                          )}
+                        >
+                          {swapState?.inBaseOutQuoteSpotPrice && (
+                            <SkeletonLoader
+                              isLoaded={
+                                type !== "market" ||
+                                !swapState.inAmountInput.isTyping ||
+                                !swapState.outAmountInput.isTyping
+                              }
+                            >
+                              {ExpectedRate(
+                                swapState,
+                                outAsBase,
+                                treatAsStable,
+                                priceOverride
+                              )}
+                            </SkeletonLoader>
+                          )}
+                        </span>
+                      </div>
+                    </GenericDisclaimer>
+                  </SkeletonLoader>
+                  <Disclosure.Button
+                    className={classNames(
+                      "relative flex items-center justify-between py-1 transition-opacity"
+                    )}
+                    disabled={isInAmountEmpty || isOutAmountEmpty}
+                  >
+                    <GenericDisclaimer
+                      title="High price impact"
+                      body="With a trade of this size, you may receive a significantly lower value due to low liquidity between the selected assets"
+                      disabled={!isPriceImpactHigh || open}
+                    >
+                      <div
+                        className={classNames(
+                          "flex items-center gap-2 transition-opacity",
+                          {
+                            "opacity-0": isInAmountEmpty || isOutAmountEmpty,
+                          }
+                        )}
+                      >
+                        {isPriceImpactHigh && !open && (
+                          <Icon
+                            id="alert-circle-filled"
+                            width={16}
+                            height={16}
+                          />
+                        )}
+                        <span className="body2 sm:caption whitespace-nowrap text-wosmongton-300">
+                          {open ? t("swap.hideDetails") : t("swap.showDetails")}
+                        </span>
+                      </div>
+                    </GenericDisclaimer>
+                  </Disclosure.Button>
+                </div>
+                <Disclosure.Panel className="body2 sm:caption flex flex-col text-osmoverse-300">
+                  {type === "market" ? (
+                    <RecapRow
+                      className={classNames({
+                        hidden:
+                          !priceImpactUnknown &&
+                          getShouldHideSlippage(priceImpact),
+                      })}
+                      left={
+                        <GenericDisclaimer
+                          title={t("tradeDetails.priceImpact.header")}
+                          body={t("tradeDetails.priceImpact.content")}
+                        >
+                          {t("assets.transfer.priceImpact")}
+                        </GenericDisclaimer>
+                      }
+                      right={
+                        <GenericDisclaimer
+                          title="High price impact"
+                          body="With a trade of this size, you may receive a significantly lower value due to low liquidity between the selected assets"
+                          disabled={!isPriceImpactHigh}
+                        >
+                          <div className="inline-flex items-center gap-1">
+                            {isPriceImpactHigh && (
+                              <Icon
+                                id="alert-circle-filled"
+                                width={16}
+                                height={16}
+                              />
+                            )}
+                            <span
+                              className={classNames({
+                                "text-rust-400": isPriceImpactHigh,
+                                "text-bullish-400":
+                                  !isPriceImpactHigh && isPriceImpactPositive,
+                                "text-osmoverse-100":
+                                  !isPriceImpactHigh && !isPriceImpactPositive,
+                              })}
+                            >
+                              {priceImpactUnknown
+                                ? t("transfer.unknown")
+                                : formatPretty(priceImpact ?? new Dec(0))}
+                            </span>
+                          </div>
+                        </GenericDisclaimer>
+                      }
+                    />
+                  ) : (
+                    <RecapRow
+                      left={<span>{t("limitOrders.tradeFees")}</span>}
+                      right={
+                        !limitTotalFees ? (
+                          <span className="text-bullish-400">
+                            {t("transfer.free")}
+                          </span>
+                        ) : (
+                          <span>{limitTotalFees}</span>
+                        )
+                      }
+                    />
+                  )}
+                  {type === "market" && (
+                    <RecapRow
+                      left={
+                        <GenericDisclaimer
+                          title={t("tradeDetails.swapFees.header")}
+                          body={t("tradeDetails.swapFees.content")}
+                        >
+                          {t("pools.aprBreakdown.swapFees")}
+                        </GenericDisclaimer>
+                      }
+                      right={
+                        <>
+                          {swapState?.tokenInFeeAmountFiatValue && (
+                            <>
+                              {swapState?.tokenInFeeAmountFiatValue
+                                .toDec()
+                                .gt(new Dec(0)) ? (
+                                <span>
+                                  <span className="text-osmoverse-100">
+                                    {swapState?.tokenInFeeAmountFiatValue
+                                      .toDec()
+                                      .lte(new Dec(0.01)) ? (
+                                      <>&lt;$0.01</>
+                                    ) : (
+                                      <>
+                                        ~
+                                        {formatPretty(
+                                          swapState?.tokenInFeeAmountFiatValue,
+                                          {
+                                            maxDecimals: 3,
+                                            maximumSignificantDigits: 4,
+                                          }
+                                        )}
+                                      </>
+                                    )}
+                                  </span>
+                                  <span className="text-osmoverse-500">
+                                    {swapState?.quote?.swapFee
+                                      ? ` (${swapState?.quote?.swapFee})`
+                                      : ""}
+                                  </span>
+                                </span>
+                              ) : (
+                                <span className="text-bullish-400">
+                                  {t("transfer.free")}
+                                </span>
+                              )}
+                            </>
+                          )}
+                        </>
+                      }
+                    />
+                  )}
+                  {type === "market" && (
+                    <Disclosure>
+                      {({ open }) => {
+                        const routes = swapState?.quote?.split;
+                        return (
+                          <>
+                            <Disclosure.Button className="flex h-8 w-full items-center justify-between">
+                              <GenericDisclaimer
+                                title={t("tradeDetails.tradeRoute.header")}
+                                body={
+                                  <>
+                                    {t("tradeDetails.tradeRoute.contentTop")}
+                                    <br />
+                                    <br />
+                                    {t("tradeDetails.tradeRoute.contentBottom")}
+                                  </>
+                                }
+                              >
+                                <span className="body2 sm:caption text-osmoverse-300">
+                                  {t("swap.autoRouter")}
+                                </span>
+                              </GenericDisclaimer>
+                              <div className="flex items-center gap-1 text-wosmongton-300">
+                                <span className="body2 sm:caption">
+                                  {!!routes && routes.length > 0 ? (
+                                    <>
+                                      {routes?.length}{" "}
+                                      {routes?.length === 1
+                                        ? t("swap.route")
+                                        : t("swap.routes")}
+                                    </>
+                                  ) : (
+                                    <span className="text-rust-400">
+                                      {t("swap.noRoutes")}
+                                    </span>
+                                  )}
+                                </span>
+                                {!!routes && routes.length > 0 && (
+                                  <Icon
+                                    id="chevron-down"
+                                    className={classNames(
+                                      "h-[7px] w-3 text-wosmongton-200 transition-transform",
+                                      {
+                                        "rotate-180": open,
+                                      }
+                                    )}
+                                  />
+                                )}
+                              </div>
+                            </Disclosure.Button>
+                            <Disclosure.Panel className="flex w-full flex-col gap-2">
+                              <RoutesTaken
+                                {...routesVisDisclosure}
+                                split={routes ?? []}
+                                isLoading={swapState?.isQuoteLoading}
+                              />
+                            </Disclosure.Panel>
+                          </>
+                        );
+                      }}
+                    </Disclosure>
+                  )}
+                </Disclosure.Panel>
+              </div>
+            </div>
+          )}
+        </Disclosure>
+      </div>
+    );
+  }
+);
+
+function Closer({
+  close,
+  isInAmountEmpty,
+}: {
+  isInAmountEmpty: boolean;
+  close: () => void;
+}) {
+  useEffect(() => {
+    if (isInAmountEmpty) {
+      close();
+    }
+  }, [close, isInAmountEmpty]);
+
+  return <></>;
+}
+
+function ExpectedRate(
+  swapState: ReturnType<typeof useSwap>,
+  outAsBase: boolean,
+  treatAsStable: string | undefined = undefined,
+  // Used for Limit inputs to override the price display
+  priceOverride?: PricePretty
+) {
+  const inBaseOutQuoteSpotPrice =
+    swapState?.inBaseOutQuoteSpotPrice?.toDec() ?? new Dec(1);
+  if (inBaseOutQuoteSpotPrice.isZero()) {
+    console.warn("ExpectedRate: inBaseOutQuoteSpotPrice is Zero");
+    return;
+  }
+
+  let baseAsset, quoteAsset, inQuoteAssetPrice;
+  let inFiatPrice = new PricePretty(DEFAULT_VS_CURRENCY, new Dec(0));
+
+  if (treatAsStable && treatAsStable == "in") {
+    baseAsset = swapState.toAsset?.coinDenom;
+    inQuoteAssetPrice = new Dec(1).quo(inBaseOutQuoteSpotPrice);
+
+    return (
+      <span data-testid="token-price">
+        1 {baseAsset} ≈{" $"}
+        {formatPretty(priceOverride?.toDec() ?? inQuoteAssetPrice, {
+          ...getPriceExtendedFormatOptions(inQuoteAssetPrice),
+        })}{" "}
+      </span>
+    );
+  }
+
+  if (treatAsStable && treatAsStable == "out") {
+    baseAsset = swapState.fromAsset?.coinDenom;
+    inQuoteAssetPrice = inBaseOutQuoteSpotPrice;
+
+    return (
+      <span data-testid="token-price">
+        1 {baseAsset} ≈{" $"}
+        {formatPretty(priceOverride?.toDec() ?? inQuoteAssetPrice, {
+          ...getPriceExtendedFormatOptions(inQuoteAssetPrice),
+        })}{" "}
+      </span>
+    );
+  }
+
+  if (outAsBase) {
+    baseAsset = swapState.toAsset?.coinDenom;
+    quoteAsset = swapState.fromAsset?.coinDenom;
+
+    inQuoteAssetPrice = new Dec(1).quo(inBaseOutQuoteSpotPrice);
+
+    if (
+      swapState?.tokenOutFiatValue &&
+      swapState?.quote?.amountOut?.toDec().gt(new Dec(0)) &&
+      swapState.quoteType === "out-given-in"
+    ) {
+      inFiatPrice = new PricePretty(
+        DEFAULT_VS_CURRENCY,
+        swapState.tokenOutFiatValue.quo(swapState.quote.amount.toDec())
+      );
+    } else if (
+      swapState?.quote?.amountOut?.toDec().gt(new Dec(0)) &&
+      swapState.quoteType === "in-given-out"
+    ) {
+      inFiatPrice = swapState.tokenOutFiatValue.quo(
+        swapState.outAmountInput?.amount?.toDec() ?? new Dec(1)
+      );
+    } else {
+      if (swapState.inAmountInput?.price) {
+        inFiatPrice = swapState.inAmountInput?.price?.quo(
+          inBaseOutQuoteSpotPrice
+        );
+      }
+    }
+  } else {
+    baseAsset = swapState.fromAsset?.coinDenom;
+    quoteAsset = swapState.toAsset?.coinDenom;
+
+    inQuoteAssetPrice = inBaseOutQuoteSpotPrice;
+
+    if (
+      swapState.tokenOutFiatValue &&
+      swapState.inAmountInput?.amount?.toDec().gt(new Dec(0))
+    ) {
+      inFiatPrice = swapState.tokenOutFiatValue.quo(
+        swapState.inAmountInput.amount.toDec()
+      );
+    } else {
+      inFiatPrice =
+        swapState.inAmountInput.price ??
+        new PricePretty(DEFAULT_VS_CURRENCY, new Dec(0));
+    }
+  }
+
+  return (
+    <span data-testid="token-price">
+      1 {baseAsset} ≈{" "}
+      {formatPretty(inQuoteAssetPrice, {
+        minimumSignificantDigits: 6,
+        maximumSignificantDigits: 6,
+        maxDecimals: 10,
+        notation: "standard",
+      })}{" "}
+      {quoteAsset} (
+      {formatPretty(inFiatPrice, {
+        ...getPriceExtendedFormatOptions(inFiatPrice.toDec()),
+      })}
+      )
+    </span>
+  );
+}
+
+type Split =
+  | RouterOutputs["local"]["quoteRouter"]["routeTokenOutGivenIn"]["split"]
+  | RouterOutputs["local"]["quoteRouter"]["routeTokenInGivenOut"]["split"];
+type Route = Split[number];
+type RouteWithPercentage = Route & { percentage?: RatePretty };
+
+function RoutesTaken({
+  split,
+  isLoading,
+}: { split: Split } & Pick<UseDisclosureReturn, "isOpen" | "onToggle"> & {
+    isLoading?: boolean;
+  }) {
+  // hold on to a ref of the last split to use while we're loading the next one
+  // this prevents whiplash in the UI
+  const latestSplitRef = useLatestWhen(split, (s) => s.length > 0);
+
+  const displayedSplit = isLoading ? (latestSplitRef ?? split) : split;
+
+  const tokenInTotal = useMemo(
+    () =>
+      displayedSplit.reduce(
+        (sum, { initialAmount }) => sum.add(new Dec(initialAmount)),
+        new Dec(0)
+      ),
+    [displayedSplit]
+  );
+
+  const splitWithPercentages: RouteWithPercentage[] = useMemo(() => {
+    if (displayedSplit.length === 1) return displayedSplit;
+
+    return displayedSplit.map((route) => {
+      const percentage = new RatePretty(
+        new Dec(route.initialAmount).quo(tokenInTotal).mul(new Dec(100))
+      ).moveDecimalPointLeft(2);
+
+      return {
+        ...route,
+        percentage,
+      };
+    });
+  }, [displayedSplit, tokenInTotal]);
+
+  return (
+    <div className="flex flex-col gap-2">
+      {splitWithPercentages.map((route) => (
+        <RouteLane
+          key={route.pools.map(({ id }) => id).join()} // pool IDs are unique
+          route={route}
+        />
+      ))}
+    </div>
+  );
+}

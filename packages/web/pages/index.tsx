@@ -1,0 +1,132 @@
+import dayjs from "dayjs";
+import Image from "next/image";
+import { useRouter } from "next/router";
+import { CSSProperties } from "react";
+import { useLocalStorage } from "react-use";
+
+import { AdBanners } from "~/components/ad-banner";
+import {
+  AssetHighlights,
+  highlightPrice24hChangeAsset,
+} from "~/components/assets/highlights-categories";
+import { ClientOnly } from "~/components/client-only";
+import { ErrorBoundary } from "~/components/error/error-boundary";
+import { TradeTool } from "~/components/trade-tool";
+import { useFeatureFlags, useTranslation } from "~/hooks";
+import { useNavBarStore } from "~/stores/nav-bar-store";
+import { api } from "~/utils/trpc";
+
+export const SwapPreviousTradeKey = "swap-previous-trade";
+export type PreviousTrade = {
+  sendTokenDenom: string;
+  outTokenDenom: string;
+  baseDenom: string;
+  quoteDenom: string;
+};
+
+const Home = () => {
+  const featureFlags = useFeatureFlags();
+  const visibleBannerHeight = useNavBarStore(
+    (state) => state.visibleBannerHeight
+  );
+
+  const [previousTrade, setPreviousTrade] =
+    useLocalStorage<PreviousTrade>(SwapPreviousTradeKey);
+
+  return (
+    <main className="relative flex overflow-auto pb-2 pt-8 h-content md:h-content-mobile">
+      <div className="fixed inset-0 h-full w-full overflow-y-scroll bg-cover xl:static">
+        <div className="relative h-full w-full xl:hidden">
+          <Image
+            src="/images/osmosis-home-bg-alt.svg"
+            alt=""
+            width={1544}
+            height={720}
+            className="absolute bottom-0 max-h-[720px] w-full"
+          />
+        </div>
+        {/* Viewport-fixed above xl, so it clears the navbar and banner stack
+            itself. At xl and below the wrapper is static and `main` already
+            sits under the navbar and its in-flow banner spacer, so only the
+            32px gap applies; adding either height again double-counts it. */}
+        <div
+          className="absolute inset-0 top-[calc(104px+var(--visible-banner-height))] flex h-auto w-full justify-center xl:top-8 md:top-0"
+          style={
+            {
+              "--visible-banner-height": `${visibleBannerHeight}px`,
+            } as CSSProperties
+          }
+        >
+          <div className="flex w-[512px] flex-col gap-4 lg:mx-auto md:mt-5 md:w-full md:px-5">
+            {featureFlags.swapsAdBanner && <SwapAdsBanner />}
+            {/** Hydration issues need to be investigated before this client wrapper can be removed. */}
+            <ClientOnly>
+              <TradeTool
+                previousTrade={previousTrade}
+                setPreviousTrade={setPreviousTrade}
+              />
+            </ClientOnly>
+            {featureFlags.swapToolTopGainers && <TopGainers />}
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+};
+
+const TopGainers = () => {
+  const { t } = useTranslation();
+  const router = useRouter();
+
+  const { data: topGainerAssets, isLoading: isTopGainerAssetsLoading } =
+    api.edge.assets.getTopGainerAssets.useQuery(
+      { topN: 4 },
+      // A failing server times out after about 12 s; one retry is enough.
+      { retry: 1 }
+    );
+
+  // Hidden when it has nothing to show, e.g. while market data is unavailable.
+  if (!isTopGainerAssetsLoading && !topGainerAssets?.length) return null;
+
+  return (
+    <AssetHighlights
+      className="bg-osmoverse-1000/40 px-2"
+      title={t("assets.highlights.topGainers")}
+      subtitle="24h"
+      isLoading={isTopGainerAssetsLoading}
+      assets={(topGainerAssets ?? []).map(highlightPrice24hChangeAsset)}
+      onClickSeeAll={() => {
+        router.push(`/assets?category=topGainers`);
+      }}
+    />
+  );
+};
+
+const SwapAdsBanner = () => {
+  const { data, isLoading } = api.local.cms.getSwapAdBanners.useQuery(
+    undefined,
+    {
+      staleTime: 1000 * 60 * 30, // 30 minutes
+      gcTime: 1000 * 60 * 30, // 30 minutes
+      select: (data) => ({
+        ...data,
+        banners: data.banners.filter((banner) =>
+          banner.startDate || banner.endDate
+            ? dayjs().isBetween(banner.startDate, banner.endDate)
+            : true
+        ),
+      }),
+    }
+  );
+
+  if (!data?.banners || isLoading) return null;
+
+  return (
+    // If there is an error, we don't want to show the banner
+    <ErrorBoundary fallback={null}>
+      <AdBanners ads={data.banners} localization={data.localization} />
+    </ErrorBoundary>
+  );
+};
+
+export default Home;

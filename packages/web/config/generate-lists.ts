@@ -1,0 +1,637 @@
+/**
+ * This file is used to generate the asset-list.ts and chain-list.ts files.
+ *
+ * Reasons we need to generate chain-list.ts:
+ *  1. We need to apply the Osmosis chain overwrites and drop chains without an asset list.
+ *  2. We need to determine all the available chain ids for added type safety.
+ *
+ * The Keplr `ChainInfo` and CosmosKit fields are derived at runtime (see `keplr-chain.ts`), not stored.
+ *
+ * Reasons we need to generate asset-list.ts:
+ *  1. We need to determine all the available asset symbols for added type safety.
+ */
+
+import { queryLatestCommitHash } from "@osmosis-labs/server";
+import type {
+  Asset,
+  AssetList,
+  Chain,
+  ChainList,
+  IbcTransferMethod,
+} from "@osmosis-labs/types";
+import { isNil } from "@osmosis-labs/utils";
+import * as fs from "fs";
+
+import { generateTsFile } from "~/utils/codegen";
+
+import {
+  ASSET_LIST_COMMIT_HASH,
+  GITHUB_API_TOKEN,
+  IS_TESTNET,
+  OSMOSIS_CHAIN_ID_OVERWRITE,
+  OSMOSIS_CHAIN_NAME_OVERWRITE,
+} from "./env";
+import { getImageRelativeFilePath } from "./keplr-chain";
+import {
+  codegenDir,
+  fetchWithRetry,
+  getChainList,
+  getOsmosisChainId,
+  runWithFailureLimit,
+  saveAssetImageToTokensDir,
+  writeCurrentAssetListHash,
+} from "./utils";
+
+interface ResponseAssetList {
+  chainName: string;
+  assets: Omit<Asset, "chain_id">[];
+}
+
+const repo = "osmosis-labs/assetlists";
+
+/**
+ * Where to read asset list files from at a pinned commit, in order. GitHub
+ * raw rate-limits the shared egress IPs of build hosts (429s from Fastly), so
+ * jsDelivr's GitHub mirror is the fallback. Both serve the same bytes for a
+ * commit hash, so the generated output doesn't depend on which one answered.
+ */
+const ASSET_LIST_SOURCES: {
+  name: string;
+  getUrl: (commitHash: string, filePath: string) => string;
+}[] = [
+  {
+    name: "GitHub raw",
+    getUrl: (commitHash, filePath) =>
+      `https://raw.githubusercontent.com/${repo}/${commitHash}/${filePath}`,
+  },
+  {
+    name: "jsDelivr",
+    getUrl: (commitHash, filePath) =>
+      `https://cdn.jsdelivr.net/gh/${repo}@${commitHash}/${filePath}`,
+  },
+];
+
+const IMAGE_DOWNLOAD_CONCURRENCY = 16;
+const IMAGE_DOWNLOAD_MAX_FAILURES = 10;
+
+function getFilePath({
+  chainId,
+  fileType,
+}: {
+  chainId: string;
+  fileType: "assetlist" | "chainlist";
+}) {
+  // // TEMPORARY
+  // // use legacy chain list
+  // if (fileType === "chainlist") {
+  //   return `${chainId}/${chainId}.${fileType}.json`;
+  // }
+
+  return `${chainId}/generated/frontend/${fileType}.json`;
+}
+
+/**
+ * Fetch an asset list file at `commitHash`, retrying each source in
+ * `ASSET_LIST_SOURCES` before moving on to the next.
+ * @throws When every source failed.
+ */
+async function queryAssetListFile<T>({
+  filePath,
+  commitHash,
+}: {
+  filePath: string;
+  commitHash: string;
+}): Promise<T> {
+  const errors: string[] = [];
+  for (const { name, getUrl } of ASSET_LIST_SOURCES) {
+    try {
+      const response = await fetchWithRetry(getUrl(commitHash, filePath));
+      return (await response.json()) as T;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      console.warn(`Failed to fetch ${filePath} from ${name}: ${message}`);
+      errors.push(`${name}: ${message}`);
+    }
+  }
+  throw new Error(
+    `Failed to fetch ${filePath} at ${commitHash} from every source. ${errors.join("; ")}`
+  );
+}
+
+async function generateChainListFile({
+  assetLists,
+  chainList,
+  environment,
+  overwriteFile,
+  onlyTypes,
+}: {
+  assetLists: AssetList[];
+  chainList: ChainList;
+  environment: "testnet" | "mainnet";
+  /**
+   * If true, will only include types for available chains.
+   */
+  onlyTypes: boolean;
+  /**
+   * If true, will overwrite file.
+   */
+  overwriteFile: boolean;
+}) {
+  const allAvailableChains: Pick<Chain, "chain_id" | "chain_name">[] = [
+    ...chainList.chains,
+    ...(OSMOSIS_CHAIN_ID_OVERWRITE && OSMOSIS_CHAIN_NAME_OVERWRITE
+      ? [
+          {
+            chain_id: OSMOSIS_CHAIN_ID_OVERWRITE,
+            chain_name: OSMOSIS_CHAIN_NAME_OVERWRITE,
+          },
+        ]
+      : []),
+  ];
+
+  let content: string = "";
+
+  const chainIdTypeName =
+    environment === "mainnet" ? "MainnetChainIds" : "TestnetChainIds";
+
+  if (!onlyTypes) {
+    content += `
+      import type { Chain } from "@osmosis-labs/types";
+      export const ChainList: ( Omit<Chain, "chain_id"> & { chain_id: ${chainIdTypeName} })[] = ${JSON.stringify(
+        getChainList({ assetLists, environment, chains: chainList.chains }),
+        null,
+        2
+      )};
+    `;
+  }
+
+  content += `
+    export type ${chainIdTypeName} = ${Array.from(
+      new Set(allAvailableChains.map((c) => c.chain_id))
+    )
+      .map(
+        (chainId) =>
+          `"${chainId}" /** ${
+            allAvailableChains.find((c) => c.chain_id === chainId)!.chain_name
+          } */`
+      )
+      .join(" | ")};
+  `;
+
+  if (
+    !(await generateTsFile(content, codegenDir, "chain-list.ts", overwriteFile))
+  )
+    throw new Error("Failed to generate chain list file");
+}
+
+function createOrAddToAssetList(
+  assetList: AssetList[],
+  chain: Chain,
+  asset: Asset,
+  environment: "testnet" | "mainnet"
+): AssetList[] {
+  const assetlistIndex = assetList.findIndex(
+    ({ chain_name }) => chain_name === chain.chain_name
+  );
+
+  const isOsmosis = chain.chain_id === getOsmosisChainId(environment);
+
+  const chainId = isOsmosis
+    ? (OSMOSIS_CHAIN_ID_OVERWRITE ?? chain.chain_id ?? "")
+    : (chain.chain_id ?? "");
+  const chainName = chain.chain_name;
+  const imageUrl = asset?.logoURIs?.svg ?? asset?.logoURIs?.png;
+
+  const augmentedAsset: Asset = {
+    ...asset,
+    logoURIs: asset.logoURIs ?? {
+      png: "",
+      svg: "",
+    },
+    relative_image_url: imageUrl
+      ? getImageRelativeFilePath(imageUrl, asset.symbol)
+      : "",
+  };
+
+  if (assetlistIndex === -1) {
+    assetList.push({
+      chain_name: chainName,
+      chain_id: chainId,
+      assets: [augmentedAsset],
+    });
+  } else {
+    assetList[assetlistIndex].assets.push(augmentedAsset);
+  }
+
+  return assetList;
+}
+
+/** Generates asset list TypeScript file. */
+async function generateAssetListFile({
+  chains,
+  environment,
+  overwriteFile,
+  onlyTypes,
+  assetList,
+}: {
+  chains: Chain[];
+  environment: "testnet" | "mainnet";
+  /**
+   * If true, will only include types for available assets.
+   */
+  onlyTypes: boolean;
+  /**
+   * If true, will overwrite file.
+   */
+  overwriteFile: boolean;
+  assetList: ResponseAssetList;
+}) {
+  const osmosisChainId = getOsmosisChainId(environment);
+
+  const assetLists = assetList.assets.reduce<AssetList[]>((acc, asset) => {
+    /** If it's from the first chain, assume it's an Osmosis asset */
+    if (asset.chainName === chains[0].chain_name) {
+      const chain = chains.find((chain) => chain.chain_id === osmosisChainId);
+
+      if (!chain) {
+        throw new Error("Failed to find chain osmosis");
+      }
+
+      return createOrAddToAssetList(acc, chain, asset, environment);
+    }
+
+    /** Check if asset has any transfer methods at all */
+    if (!asset.transferMethods || asset.transferMethods.length === 0) {
+      // Asset has no transfer methods - could be:
+      // 1. Native Osmosis asset (no counterparty) - silent
+      // 2. Factory token (sourceDenom starts with factory/) - silent
+      // 3. Stranded from defunct chain (has counterparty, not factory) - warn
+      const hasCounterparty =
+        asset.counterparty && asset.counterparty.length > 0;
+      const isFactoryToken = asset.sourceDenom?.startsWith("factory/");
+
+      // Only warn for truly stranded tokens (not factory tokens)
+      if (hasCounterparty && !isFactoryToken) {
+        console.warn(
+          `[${environment.toUpperCase()}] Asset ${
+            asset.symbol
+          } has no transfer methods - adding as Osmosis-based asset (not bridgeable)`
+        );
+      }
+
+      const osmosisChain = chains.find(
+        (chain) => chain.chain_id === osmosisChainId
+      );
+
+      if (!osmosisChain) {
+        throw new Error("Failed to find chain osmosis");
+      }
+
+      return createOrAddToAssetList(acc, osmosisChain, asset, environment);
+    }
+
+    /** Otherwise, look for IBC transfer method to determine counterparty chain */
+    const cosmosCounterparty = [...asset.transferMethods]
+      .reverse()
+      .find(({ type }) => type === "ibc") as IbcTransferMethod | undefined;
+
+    if (!cosmosCounterparty) {
+      // Asset has transfer methods but no IBC method (e.g., bridge methods)
+      // Look for counterparty chain info in the asset's counterparty array
+      const assetCounterparty = asset.counterparty?.[0];
+
+      if (assetCounterparty && "chainName" in assetCounterparty) {
+        // Found cosmos counterparty with chain name
+        const chain = chains.find(
+          (c) => c.chain_name === assetCounterparty.chainName
+        );
+
+        if (!chain) {
+          console.error(
+            `Failed to find chain ${assetCounterparty.chainName}. ${asset.symbol} for that chain will be skipped.`
+          );
+          return acc;
+        }
+
+        return createOrAddToAssetList(acc, chain, asset, environment);
+      }
+
+      // No counterparty info found, add to Osmosis as fallback
+      const osmosisChain = chains.find(
+        (chain) => chain.chain_id === osmosisChainId
+      );
+
+      if (!osmosisChain) {
+        throw new Error("Failed to find chain osmosis");
+      }
+
+      return createOrAddToAssetList(acc, osmosisChain, asset, environment);
+    }
+
+    const counterpartyChainName = cosmosCounterparty.counterparty.chainName;
+
+    const chain = chains.find(
+      (chain) => chain.chain_name === counterpartyChainName
+    );
+
+    if (!chain) {
+      console.error(
+        `Failed to find chain ${counterpartyChainName}. ${asset.symbol} for that chain will be skipped.`
+      );
+      return acc;
+    }
+
+    return createOrAddToAssetList(acc, chain, asset, environment);
+  }, [] as AssetList[]);
+
+  let content: string = "";
+
+  if (!onlyTypes) {
+    content += `
+      import type { AssetList } from "@osmosis-labs/types";
+      export const AssetLists: AssetList[] = ${JSON.stringify(
+        assetLists,
+        null,
+        2
+      )};    
+    `;
+  }
+
+  // create available symbols type
+  content += `    
+    export type ${
+      environment === "testnet" ? "TestnetAssetSymbols" : "MainnetAssetSymbols"
+    } = ${Array.from(new Set(assetList.assets.map((asset) => asset.symbol)))
+      .map(
+        (symbol) =>
+          `"${symbol}" /** source denom: ${
+            assetList.assets.find((asset) => asset.symbol === symbol)!
+              .sourceDenom
+          } */`
+      )
+      .join(" | ")};
+  `;
+
+  content += `    
+    export type ${
+      environment === "testnet"
+        ? "TestnetVariantGroupKeys"
+        : "MainnetVariantGroupKeys"
+    } = ${Array.from(
+      new Set(assetList.assets.map((asset) => asset.variantGroupKey))
+    )
+      .filter((groupKey, index, self) => {
+        if (isNil(groupKey)) {
+          return false;
+        }
+
+        // remove duplicates
+        return self.indexOf(groupKey) === index;
+      })
+      .map(
+        (groupKey) =>
+          `"${groupKey}" /** Symbols: ${assetList.assets
+            .filter((asset) => asset.variantGroupKey === groupKey)!
+            .map((asset) => asset.symbol)
+            .join(",")} */`
+      )
+      .join(" | ")};
+  `;
+
+  const success = await generateTsFile(
+    content,
+    codegenDir,
+    "asset-lists.ts",
+    overwriteFile
+  );
+
+  if (success) {
+    if (overwriteFile) {
+      const addedAssetsSize = assetLists
+        .flatMap(({ assets }) => assets)
+        .reduce((acc, asset) => {
+          acc.add(asset.symbol);
+          return acc;
+        }, new Set()).size;
+      console.info("Successfully added", addedAssetsSize, "assets");
+    }
+    return assetLists;
+  } else {
+    throw new Error("Failed to write asset list file.");
+  }
+}
+
+async function generateAssetImages({
+  assetList,
+  commitHash,
+}: {
+  assetList: ResponseAssetList;
+  commitHash: string;
+}) {
+  console.time("Successfully downloaded images");
+  // ~1300 images: downloading them one at a time dominated build time on
+  // fresh clones (~3 min), so fetch with a small pool of workers instead.
+  // Assets sharing a symbol write to the same file, so group them by path and
+  // download each group in order on one worker. That avoids concurrent writes
+  // to one path and keeps the previous sequential behavior: the last
+  // successful download wins, and a failed one leaves an earlier image.
+  const downloads = new Map<
+    string,
+    { imageUrl: string; asset: Pick<Asset, "symbol"> }[]
+  >();
+  for (const asset of assetList.assets) {
+    const imageUrl = asset?.logoURIs?.svg ?? asset?.logoURIs?.png;
+    if (!imageUrl) continue;
+    const filePath = getImageRelativeFilePath(imageUrl, asset.symbol);
+    const candidates = downloads.get(filePath) ?? [];
+    candidates.push({ imageUrl, asset });
+    downloads.set(filePath, candidates);
+  }
+
+  // A few dead logo URLs in the asset list shouldn't block a deploy, but a
+  // wave of failures (a rate limit that outlasted the retries, a host outage)
+  // would otherwise ship with missing logos and exit 0. Once the limit is
+  // passed the build is going to fail anyway, so the pool stops taking new
+  // groups rather than spending up to three capped waits on each remaining
+  // image.
+  const { failures, skipped } = await runWithFailureLimit(
+    Array.from(downloads.values()),
+    {
+      concurrency: IMAGE_DOWNLOAD_CONCURRENCY,
+      maxFailures: IMAGE_DOWNLOAD_MAX_FAILURES,
+      run: (download) =>
+        saveAssetImageToTokensDir({
+          ...download,
+          currentAssetListHash: commitHash,
+        }),
+      onError: (e) => console.error(e instanceof Error ? e.message : e),
+    }
+  );
+  console.timeEnd("Successfully downloaded images");
+
+  if (failures > IMAGE_DOWNLOAD_MAX_FAILURES) {
+    throw new Error(
+      `${failures} asset images failed to download (more than ${IMAGE_DOWNLOAD_MAX_FAILURES} allowed); ` +
+        `stopped with ${skipped} image groups not attempted.`
+    );
+  }
+  if (failures > 0) {
+    console.warn(`${failures} asset images failed to download.`);
+  }
+}
+
+async function getLatestCommitHash() {
+  try {
+    return await queryLatestCommitHash({
+      repo,
+      branch: "main",
+      githubToken: GITHUB_API_TOKEN,
+    });
+  } catch (e) {
+    console.info(
+      "You can set the GITHUB_API_TOKEN environment variable to increase the rate limit."
+    );
+  }
+}
+
+async function main() {
+  if (!fs.existsSync(codegenDir)) {
+    fs.mkdirSync(codegenDir);
+  }
+
+  const mainnetOsmosisChainId = getOsmosisChainId("mainnet");
+  const testnetOsmosisChainId = getOsmosisChainId("testnet");
+
+  const mainLatestCommitHash =
+    ASSET_LIST_COMMIT_HASH ?? (await getLatestCommitHash());
+
+  if (!mainLatestCommitHash) {
+    throw new Error("Failed to get latest commit hash");
+  }
+
+  console.info(`Using hash '${mainLatestCommitHash}' to generate assets`);
+
+  const [
+    mainnetChainList,
+    testnetChainList,
+    mainnetResponseAssetList,
+    testnetResponseAssetList,
+  ] = await Promise.all([
+    queryAssetListFile<ChainList>({
+      filePath: getFilePath({
+        chainId: mainnetOsmosisChainId,
+        fileType: "chainlist",
+      }),
+      commitHash: mainLatestCommitHash,
+    }),
+    queryAssetListFile<ChainList>({
+      filePath: getFilePath({
+        chainId: testnetOsmosisChainId,
+        fileType: "chainlist",
+      }),
+      commitHash: mainLatestCommitHash,
+    }),
+    queryAssetListFile<ResponseAssetList>({
+      filePath: getFilePath({
+        chainId: mainnetOsmosisChainId,
+        fileType: "assetlist",
+      }),
+      commitHash: mainLatestCommitHash,
+    }),
+    queryAssetListFile<ResponseAssetList>({
+      filePath: getFilePath({
+        chainId: testnetOsmosisChainId,
+        fileType: "assetlist",
+      }),
+      commitHash: mainLatestCommitHash,
+    }),
+  ]);
+
+  await generateAssetImages({
+    assetList: IS_TESTNET ? testnetResponseAssetList : mainnetResponseAssetList,
+    commitHash: mainLatestCommitHash,
+  });
+
+  writeCurrentAssetListHash(mainLatestCommitHash);
+
+  let mainnetAssetLists: AssetList[] | undefined;
+  let testnetAssetLists: AssetList[] | undefined;
+
+  /**
+   * If testnet, generate testnet asset list first to avoid overwriting the mainnet types.
+   */
+  if (IS_TESTNET) {
+    testnetAssetLists = await generateAssetListFile({
+      chains: testnetChainList.chains,
+      assetList: testnetResponseAssetList,
+      environment: "testnet",
+      overwriteFile: true,
+      onlyTypes: false,
+    });
+    mainnetAssetLists = await generateAssetListFile({
+      chains: mainnetChainList.chains,
+      assetList: mainnetResponseAssetList,
+      environment: "mainnet",
+      overwriteFile: false,
+      onlyTypes: true,
+    });
+  } else {
+    mainnetAssetLists = await generateAssetListFile({
+      chains: mainnetChainList.chains,
+      assetList: mainnetResponseAssetList,
+      environment: "mainnet",
+      overwriteFile: true,
+      onlyTypes: false,
+    });
+    testnetAssetLists = await generateAssetListFile({
+      chains: testnetChainList.chains,
+      assetList: testnetResponseAssetList,
+      environment: "testnet",
+      overwriteFile: false,
+      onlyTypes: true,
+    });
+  }
+
+  if (!mainnetAssetLists || !testnetAssetLists)
+    throw new Error("Failed to generate asset lists");
+
+  /**
+   * If testnet, generate testnet chain list first to avoid overwriting the mainnet types.
+   */
+  if (IS_TESTNET) {
+    await generateChainListFile({
+      assetLists: testnetAssetLists,
+      chainList: testnetChainList,
+      environment: "testnet",
+      onlyTypes: false,
+      overwriteFile: true,
+    });
+    await generateChainListFile({
+      assetLists: mainnetAssetLists,
+      chainList: mainnetChainList,
+      environment: "mainnet",
+      onlyTypes: true,
+      overwriteFile: false,
+    });
+  } else {
+    await generateChainListFile({
+      assetLists: mainnetAssetLists,
+      chainList: mainnetChainList,
+      environment: "mainnet",
+      onlyTypes: false,
+      overwriteFile: true,
+    });
+    await generateChainListFile({
+      assetLists: testnetAssetLists,
+      chainList: testnetChainList,
+      environment: "testnet",
+      onlyTypes: true,
+      overwriteFile: false,
+    });
+  }
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

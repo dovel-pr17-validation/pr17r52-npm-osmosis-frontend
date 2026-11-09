@@ -1,0 +1,160 @@
+import { DEFAULT_VS_CURRENCY } from "@osmosis-labs/server";
+import { Dec, PricePretty } from "@osmosis-labs/unit";
+import classNames from "classnames";
+import { PropsWithChildren, ReactElement } from "react";
+
+import { Icon } from "~/components/assets";
+import { SkeletonLoader } from "~/components/loaders";
+import { PrivateText } from "~/components/privacy";
+import { Tooltip } from "~/components/tooltip";
+import { CustomClasses } from "~/components/types";
+import { Button } from "~/components/ui/button";
+import { useFeatureFlags, useTranslation } from "~/hooks";
+import { useBridgeStore } from "~/hooks/bridge";
+import { useAssetInfo } from "~/hooks/use-asset-info";
+import { useWallet } from "~/hooks/use-wallet";
+import { useUserSettingsStore } from "~/stores/user-settings-store";
+import { formatPretty } from "~/utils/formatter";
+import {
+  depositHaltReasonKey,
+  withdrawalHaltReasonKey,
+} from "~/utils/halt-reasons";
+import { api } from "~/utils/trpc";
+
+const ConditionalTooltip = ({
+  children,
+  content,
+}: PropsWithChildren<{ content: string | undefined }>) =>
+  content ? (
+    <Tooltip content={content} className="h-full flex-1">
+      {children as ReactElement}
+    </Tooltip>
+  ) : (
+    <div className="flex h-full flex-1">{children}</div>
+  );
+
+export const AssetBalance = ({ className }: CustomClasses) => {
+  const bridgeAsset = useBridgeStore((state) => state.bridgeAsset);
+  const { asset } = useAssetInfo();
+  const { t } = useTranslation();
+  const featureFlags = useFeatureFlags();
+  const hideBalances = useUserSettingsStore((state) => state.hideBalances);
+
+  const { address, isWalletConnected } = useWallet();
+
+  const { data, isLoading } = api.edge.assets.getUserBridgeAsset.useQuery(
+    {
+      findMinDenomOrSymbol: asset.coinDenom,
+      userOsmoAddress: address,
+    },
+    { enabled: Boolean(address) }
+  );
+
+  if (!isWalletConnected) {
+    return null;
+  }
+
+  // Factory tokens are native Osmosis assets (alloyed, liquid staking, etc.)
+  const isFactoryToken = asset.coinMinimalDenom?.startsWith("factory/");
+
+  // A stranded token has counterparty info but no transfer methods (defunct chain)
+  // Exclude factory tokens which are intentionally native to Osmosis
+  const isStrandedToken =
+    data?.transferMethods.length === 0 &&
+    Boolean(data?.counterparty?.length) &&
+    !isFactoryToken;
+
+  const transferEnabled = featureFlags.newDepositWithdrawFlow
+    ? !isStrandedToken // new flow supports native assets, disable only stranded tokens
+    : Boolean(data?.transferMethods.length); // old flow requires transfer methods
+
+  const depositsHalted = asset.areDepositsHalted;
+  const withdrawalsHalted = asset.areWithdrawalsHalted;
+
+  const depositDisabledReason = isStrandedToken
+    ? t("assets.strandedTokenDepositDisabled")
+    : depositsHalted
+      ? (asset.tooltipMessage ??
+        t(depositHaltReasonKey(asset.depositHaltReason)))
+      : undefined;
+  const withdrawDisabledReason = isStrandedToken
+    ? t("assets.strandedTokenWithdrawDisabled")
+    : withdrawalsHalted
+      ? (asset.tooltipMessage ??
+        t(withdrawalHaltReasonKey(asset.withdrawalHaltReason)))
+      : undefined;
+
+  return (
+    <section
+      className={classNames(
+        "rounded-3xl border border-osmoverse-700 p-6",
+        className
+      )}
+    >
+      <header className="mb-2">
+        <h5 className="text-body2 font-body2 text-osmoverse-400">
+          {t("tokenInfos.yourBalance")}
+        </h5>
+      </header>
+
+      <SkeletonLoader isLoaded={!isLoading}>
+        <p className="mb-2 text-h4 font-h4">
+          <PrivateText
+            text={
+              data?.usdValue
+                ? formatPretty(data.usdValue)
+                : new PricePretty(DEFAULT_VS_CURRENCY, new Dec(0)).toString()
+            }
+          />
+        </p>
+      </SkeletonLoader>
+
+      {!hideBalances && (
+        <SkeletonLoader isLoaded={!isLoading}>
+          <p className="mb-6 text-body1 font-body1 text-osmoverse-300">
+            {data?.amount ? formatPretty(data.amount) : `0 ${asset.coinDenom}`}{" "}
+            {t("tokenInfos.onOsmosis")}
+          </p>
+        </SkeletonLoader>
+      )}
+
+      {(transferEnabled || isStrandedToken) && (
+        <div className="flex gap-3">
+          <ConditionalTooltip content={depositDisabledReason}>
+            <Button
+              size="lg-full"
+              className="flex flex-1 items-center"
+              onClick={() =>
+                bridgeAsset({
+                  anyDenom: asset.coinMinimalDenom,
+                  direction: "deposit",
+                })
+              }
+              disabled={!transferEnabled || depositsHalted}
+            >
+              <Icon className="mr-2" id="deposit" height={16} width={16} />
+              {t("assets.historyTable.colums.deposit")}
+            </Button>
+          </ConditionalTooltip>
+          <ConditionalTooltip content={withdrawDisabledReason}>
+            <Button
+              size="lg-full"
+              className="flex flex-1 items-center"
+              variant="secondary"
+              onClick={() =>
+                bridgeAsset({
+                  anyDenom: asset.coinMinimalDenom,
+                  direction: "withdraw",
+                })
+              }
+              disabled={!transferEnabled || !data?.amount || withdrawalsHalted}
+            >
+              <Icon className="mr-2" id="withdraw" height={16} width={16} />
+              {t("assets.historyTable.colums.withdraw")}
+            </Button>
+          </ConditionalTooltip>
+        </div>
+      )}
+    </section>
+  );
+};

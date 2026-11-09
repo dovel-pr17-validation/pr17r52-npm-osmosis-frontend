@@ -1,0 +1,30 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import decompress from "@xhmikosr/decompress";
+
+export class UnzipExtension {
+  async getPathToExtension() {
+    console.log("Unzip Wallet Extension before tests.");
+    // Unzip keplr-extension-manifest
+    const pathToZip = path.join(
+      __dirname,
+      "./keplr-extension-manifest-v3-v0.13.39.zip"
+    );
+    const pathToExtension = path.join(__dirname, "./keplr-extension-manifest");
+    await decompress(pathToZip, pathToExtension);
+    console.log("✓ Keplr extension extracted successfully");
+    return pathToExtension;
+  }
+
+  async deleteExtension(pathToExtension: string) {
+    console.log("Delete Wallet Extension from " + pathToExtension);
+    fs.rm(pathToExtension, { recursive: true }, (err) => {
+      if (err) {
+        console.error("Error deleting extension:", err);
+      } else {
+        console.log("Extension deleted successfully");
+      }
+    });
+  }
+}

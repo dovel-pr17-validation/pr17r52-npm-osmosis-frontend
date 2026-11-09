@@ -1,0 +1,265 @@
+import { Dec } from "@osmosis-labs/unit";
+import dayjs from "dayjs";
+import { UTCTimestamp } from "lightweight-charts";
+import { FunctionComponent, useMemo } from "react";
+
+import { Icon } from "~/components/assets";
+import { ChartUnavailable } from "~/components/chart";
+import {
+  HistoricalChart,
+  HistoricalChartHeader,
+  HistoricalChartSkeleton,
+} from "~/components/chart/historical-chart";
+import {
+  HistoricalVolumeChart,
+  HistoricalVolumeChartSkeleton,
+} from "~/components/chart/historical-volume-chart";
+import { AdvancedChart } from "~/components/chart/light-weight-charts/advanced-chart";
+import { Button } from "~/components/ui/button";
+import { ButtonGroup, ButtonGroupItem } from "~/components/ui/button-group";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "~/components/ui/select";
+import { useFeatureFlags, useTranslation } from "~/hooks";
+import { AvailablePriceRanges, useAssetInfoHover } from "~/hooks/ui-config";
+import { useAssetInfoView } from "~/hooks/use-asset-info-view";
+import { humanizeTime } from "~/utils/date";
+import { historicalDatafeed } from "~/utils/trading-view";
+import { api } from "~/utils/trpc";
+
+export const AssetPriceChart: FunctionComponent = () => {
+  const { assetInfoConfig } = useAssetInfoView();
+  const apiUtils = api.useUtils();
+
+  const data = useMemo(
+    () =>
+      assetInfoConfig.historicalChartData.map((point) => ({
+        time: point.time as UTCTimestamp,
+        value:
+          assetInfoConfig.dataType === "price" ? point.close : point.volume,
+      })),
+    [assetInfoConfig.historicalChartData, assetInfoConfig.dataType]
+  );
+
+  return (
+    <section className="relative flex flex-col justify-between gap-3">
+      {assetInfoConfig.mode === "simple" ? <ChartHeader /> : null}
+
+      {assetInfoConfig.mode === "simple" &&
+      assetInfoConfig.historicalChartStale ? (
+        <StaleDataPill timestampMs={assetInfoConfig.lastChartTimestampMs} />
+      ) : null}
+
+      <div className="h-[400px] w-full xl:h-[476px]">
+        {assetInfoConfig.mode === "advanced" ? (
+          <AdvancedChart
+            datafeed={historicalDatafeed({ apiUtils })}
+            coinDenom={assetInfoConfig.denom}
+            load_last_chart
+          />
+        ) : assetInfoConfig.isHistoricalDataLoading ? (
+          assetInfoConfig.dataType === "price" ? (
+            <HistoricalChartSkeleton />
+          ) : (
+            <HistoricalVolumeChartSkeleton />
+          )
+        ) : !assetInfoConfig.historicalChartUnavailable ? (
+          assetInfoConfig.dataType === "price" ? (
+            <HistoricalChart
+              data={data}
+              onPointerHover={assetInfoConfig.setHoverData}
+              onPointerOut={() => {
+                assetInfoConfig.setHoverData(undefined, undefined);
+              }}
+            />
+          ) : (
+            <HistoricalVolumeChart
+              data={data}
+              onPointerHover={assetInfoConfig.setHoverData}
+              onPointerOut={() => {
+                assetInfoConfig.setHoverData(undefined, undefined);
+              }}
+            />
+          )
+        ) : (
+          <ChartUnavailable />
+        )}
+      </div>
+
+      <ChartFooter />
+    </section>
+  );
+};
+
+const ChartFooter: FunctionComponent = () => {
+  const { assetInfoConfig } = useAssetInfoView();
+  const { advancedChart } = useFeatureFlags();
+  const { t } = useTranslation();
+
+  return (
+    <footer className="flex flex-wrap justify-between gap-2">
+      {assetInfoConfig.mode === "simple" ? (
+        <ButtonGroup
+          onValueChange={assetInfoConfig.setHistoricalRange}
+          defaultValue={assetInfoConfig.historicalRange}
+        >
+          <ButtonGroupItem
+            value={AvailablePriceRanges["1h"]}
+            label={t("tokenInfos.chart.xHour", { h: "1" })}
+          />
+          <ButtonGroupItem
+            value={AvailablePriceRanges["1d"]}
+            label={t("tokenInfos.chart.xDay", { d: "1" })}
+          />
+          <ButtonGroupItem
+            value={AvailablePriceRanges["7d"]}
+            label={t("tokenInfos.chart.xDay", { d: "7" })}
+          />
+          <ButtonGroupItem
+            value={AvailablePriceRanges["1mo"]}
+            label={t("tokenInfos.chart.xDay", { d: "30" })}
+          />
+          <ButtonGroupItem
+            value={AvailablePriceRanges["1y"]}
+            label={t("tokenInfos.chart.xYear", { y: "1" })}
+          />
+          <ButtonGroupItem
+            value={AvailablePriceRanges.all}
+            label={t("tokenInfos.chart.all")}
+          />
+        </ButtonGroup>
+      ) : null}
+
+      <div className="ml-auto flex gap-2">
+        {assetInfoConfig.mode === "simple" ? (
+          <Select
+            onValueChange={assetInfoConfig.setDataType}
+            defaultValue={assetInfoConfig.dataType}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="price">
+                {t("tokenInfos.chart.price")}
+              </SelectItem>
+              <SelectItem value="volume">
+                {t("tokenInfos.chart.volume")}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+        ) : null}
+
+        {advancedChart ? (
+          <Button
+            size="xsm"
+            variant="secondary-outline"
+            onClick={() => {
+              assetInfoConfig.setMode(
+                assetInfoConfig.mode === "simple" ? "advanced" : "simple"
+              );
+            }}
+          >
+            {assetInfoConfig.mode === "simple"
+              ? t("tokenInfos.chart.advanced")
+              : t("tokenInfos.chart.simple")}
+          </Button>
+        ) : null}
+      </div>
+    </footer>
+  );
+};
+
+const ChartHeader: FunctionComponent = () => {
+  const { assetInfoConfig } = useAssetInfoView();
+  const { hoverData: hoveredPrice, hoverDate } =
+    useAssetInfoHover(assetInfoConfig);
+
+  const { data: marketAsset, isLoading } =
+    api.edge.assets.getMarketAsset.useQuery(
+      {
+        findMinDenomOrSymbol: assetInfoConfig.coinMinimalDenom!,
+      },
+      {
+        enabled: assetInfoConfig.coinMinimalDenom !== undefined,
+      }
+    );
+
+  // Undefined when market data has no current value, so it isn't shown as $0. The last
+  // chart close isn't used in its place: chart history can be served stale during a
+  // data-services outage, and a last-known price is misleading as the current one.
+  const hoverData = useMemo((): Dec | undefined => {
+    const decHoverPrice = hoveredPrice?.toDec();
+    if (decHoverPrice) return decHoverPrice;
+
+    return assetInfoConfig.dataType === "price"
+      ? marketAsset?.currentPrice?.toDec()
+      : marketAsset?.volume24h?.toDec();
+  }, [
+    hoveredPrice,
+    assetInfoConfig.dataType,
+    marketAsset?.currentPrice,
+    marketAsset?.volume24h,
+  ]);
+
+  const fiatSymbol =
+    hoveredPrice?.fiatCurrency?.symbol ??
+    marketAsset?.currentPrice?.symbol ??
+    "$";
+
+  return (
+    <header className="absolute left-0 top-0 z-10">
+      <HistoricalChartHeader
+        isLoading={isLoading || assetInfoConfig.isHistoricalDataLoading}
+        hoverData={hoverData}
+        hoverDate={hoverDate}
+        fiatSymbol={fiatSymbol}
+      />
+    </header>
+  );
+};
+
+const COMPACT_UNIT_BY_KEY: Record<string, string> = {
+  "timeUnits.second": "s",
+  "timeUnits.seconds": "s",
+  "timeUnitsShort.second": "s",
+  "timeUnitsShort.seconds": "s",
+  "timeUnits.minute": "m",
+  "timeUnits.minutes": "m",
+  "timeUnitsShort.minute": "m",
+  "timeUnitsShort.minutes": "m",
+  "timeUnits.hour": "h",
+  "timeUnits.hours": "h",
+  "timeUnitsShort.hour": "h",
+  "timeUnitsShort.hours": "h",
+  "timeUnits.day": "d",
+  "timeUnits.days": "d",
+  "timeUnitsShort.day": "d",
+  "timeUnitsShort.days": "d",
+};
+
+const StaleDataPill: FunctionComponent<{ timestampMs?: number }> = ({
+  timestampMs,
+}) => {
+  const { t } = useTranslation();
+  if (!timestampMs) return null;
+  const parts = humanizeTime(dayjs(timestampMs));
+  const compact = parts
+    .map((p) => {
+      const suffix = COMPACT_UNIT_BY_KEY[p.unitTranslationKey];
+      return suffix ? `${p.value}${suffix}` : `${p.value}`;
+    })
+    .join(" ");
+  return (
+    <div className="absolute right-20 top-0 z-10 flex items-center gap-1.5 rounded-full border border-rust-500/40 bg-osmoverse-800 px-3 py-1">
+      <Icon id="alert-triangle" className="h-4 w-4 text-rust-400" />
+      <span className="caption text-osmoverse-200">
+        {t("tokenInfos.chart.lastUpdate", { time: compact })}
+      </span>
+    </div>
+  );
+};

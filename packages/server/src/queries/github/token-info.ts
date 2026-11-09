@@ -1,0 +1,37 @@
+import { queryGithubFile } from "./file";
+
+interface GenericCmsData {
+  localization?: string;
+  name?: string;
+  symbol?: string;
+  coingeckoID?: string;
+  twitterURL?: string;
+  websiteURL?: string;
+  stakingURL?: string;
+  telegramURL?: string;
+  discordURL?: string;
+  githubURL?: string;
+  mediumURL?: string;
+}
+export interface TokenCMSData extends GenericCmsData {
+  description?: Record<string, string>;
+}
+
+// Because encoding seems different in the repo, I've added this function to replace %2F with %252F
+const replaceSlashes = (str: string) => {
+  return str.split("%2F").join("%252F");
+};
+
+export const getTokenInfo = async (
+  coinMinimalDenom: string
+): Promise<TokenCMSData> => {
+  const filePath = `osmosis-1/generated/asset_detail/${replaceSlashes(
+    encodeURIComponent(coinMinimalDenom)
+  )}.json`;
+
+  // Read from the assetlists default branch. The fe-content commit pin does not apply to this repo.
+  return queryGithubFile<TokenCMSData>({
+    repo: "osmosis-labs/assetlists",
+    filePath,
+  });
+};

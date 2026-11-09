@@ -1,0 +1,17 @@
+FROM node:24.21.0 as build
+
+WORKDIR /app
+
+COPY turbo.json package.json tsconfig.json yarn.lock /app/
+COPY packages /app/packages/
+
+RUN yarn
+RUN yarn build
+
+FROM node:24.21.0-alpine
+
+WORKDIR /app
+COPY --from=build /app .
+
+EXPOSE 3000
+CMD [ "yarn", "start" ]

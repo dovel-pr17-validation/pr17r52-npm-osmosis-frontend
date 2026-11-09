@@ -1,0 +1,50 @@
+import { useMemo, useState } from "react";
+
+import { useWindowSize } from "~/hooks";
+import { HistoryTransaction } from "~/hooks/use-transaction-history";
+import { transferKey } from "~/stores/transfer-history";
+
+export const useTransactionModal = ({
+  transactions,
+}: {
+  transactions: HistoryTransaction[];
+}) => {
+  const { isLargeDesktop } = useWindowSize();
+  const [open, setOpen] = useState(false);
+  const [selectedTransactionHash, setSelectedTransactionHash] = useState<
+    string | undefined
+  >(undefined);
+
+  // edge case - Close the slide over when the screen size changes to large desktop, reduces bugginess with transition
+  const [prevIsLargeDesktop, setPrevIsLargeDesktop] = useState(isLargeDesktop);
+  if (isLargeDesktop !== prevIsLargeDesktop) {
+    setPrevIsLargeDesktop(isLargeDesktop);
+    setOpen(false);
+  }
+
+  const onRequestClose = () => {
+    setOpen(false);
+    // add delay for smoother transition
+    setTimeout(() => setSelectedTransactionHash(undefined), 300);
+  };
+
+  const selectedTransaction = useMemo(
+    () =>
+      transactions.find(
+        (tx) =>
+          (tx.__type === "recentTransfer" ? transferKey(tx) : tx.hash) ===
+          selectedTransactionHash
+      ),
+    [transactions, selectedTransactionHash]
+  );
+
+  return {
+    open,
+    setOpen,
+    selectedTransactionHash,
+    setSelectedTransactionHash,
+    onRequestClose,
+    selectedTransaction,
+    isLargeDesktop,
+  };
+};

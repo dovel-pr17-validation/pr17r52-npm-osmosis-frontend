@@ -1,0 +1,219 @@
+import type { CosmosRegistryWallet } from "@osmosis-labs/tx";
+import { WalletConnectionInProgressError } from "@osmosis-labs/utils";
+
+import { walletInstallers } from "~/config/wallet-installers";
+
+import { MainnetChainIds } from "./generated/chain-list";
+import { CosmosKitWalletList } from "./generated/cosmos-kit-wallet-list";
+
+export const CosmosWalletRegistry: CosmosRegistryWallet[] = [
+  {
+    ...CosmosKitWalletList["keplr-extension"],
+    mobileDisabled: false,
+    logo: "/wallets/keplr.svg",
+    lazyInstall: walletInstallers["keplr-extension"],
+    windowPropertyName: "keplr",
+    stakeUrl: "https://wallet.keplr.app/chains/osmosis?tab=staking",
+    governanceUrl: "https://wallet.keplr.app/chains/osmosis?tab=governance",
+    features: ["notifications"],
+  },
+  {
+    ...CosmosKitWalletList["keplr-mobile"],
+    logo: "/wallets/keplr.svg",
+    lazyInstall: walletInstallers["keplr-mobile"],
+    supportsChain: async (chainId) => {
+      const keplrMobileAvailableChains: MainnetChainIds[] = [
+        "cosmoshub-4",
+        "osmosis-1",
+        "secret-4",
+        "regen-1",
+        "juno-1",
+        "stargaze-1",
+        "core-1", // Persistence,
+        "axelar-dojo-1",
+        "sommelier-3",
+        "umee-1",
+        "agoric-3",
+        "gravity-bridge-3",
+        "evmos_9001-2",
+        "crypto-org-chain-mainnet-1",
+        "stride-1",
+        "injective-1",
+        "mars-1",
+        "columbus-5", // Terra Classic
+        "quasar-1",
+        "quicksilver-2",
+        "omniflixhub-1",
+        "kyve-1",
+        "neutron-1",
+        "gitopia",
+        "likecoin-mainnet-2",
+        "akashnet-2",
+      ];
+
+      return keplrMobileAvailableChains.includes(chainId as MainnetChainIds);
+    },
+    stakeUrl: "https://wallet.keplr.app/chains/osmosis?tab=staking",
+    governanceUrl: "https://wallet.keplr.app/chains/osmosis?tab=governance",
+    features: [],
+  },
+  {
+    ...CosmosKitWalletList["okxwallet-extension"],
+    logo: "/wallets/okx.png",
+    lazyInstall: walletInstallers["okxwallet-extension"],
+    windowPropertyName: "okxwallet",
+    async supportsChain(chainId, retryCount = 0) {
+      if (typeof window === "undefined") return true;
+
+      const okxWallet = (window as any)?.okxwallet?.keplr as {
+        getKey: (chainId: string) => Promise<boolean>;
+      };
+
+      if (!okxWallet) return true;
+
+      try {
+        await okxWallet.getKey(chainId);
+        return true;
+      } catch (e) {
+        const error = e as { code: number; message: string };
+
+        // Check for chain not supported error
+        if (
+          error.code === -32603 &&
+          error.message.includes("There is no chain info")
+        ) {
+          return false;
+        }
+
+        // Retry if the wallet is already processing
+        if (
+          error.code === -32002 &&
+          error.message.includes("Already processing") &&
+          retryCount < 5
+        ) {
+          /**
+           * Simple exponential backoff mechanism where the delay doubles
+           * with each retry. Here, we have a base delay of 100 milliseconds.
+           * So, the first retry will wait for 200 ms,
+           * the second for 400 ms, and so on.
+           */
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.pow(2, retryCount) * 100)
+          );
+          // @ts-ignore
+          return this.supportsChain(chainId, retryCount + 1);
+        }
+
+        return false;
+      }
+    },
+    matchError: (error) => {
+      if (typeof error !== "string") return error;
+
+      if (
+        error.includes(
+          "Already processing wallet_requestIdentities. Please wait."
+        )
+      ) {
+        return new WalletConnectionInProgressError();
+      }
+
+      return error;
+    },
+    signOptions: {
+      preferNoSetFee: true,
+    },
+    features: [],
+  },
+  // {
+  //   ...CosmosKitWalletList["trust-extension"],
+  //   logo: "/wallets/trust.png",
+  //   lazyInstall: () =>
+  //     import("@cosmos-kit/trust-extension").then((m) => m.TrustExtensionWallet),
+  //   windowPropertyName: "trustwallet",
+  //   async supportsChain(chainId) {
+  //     const trustAvailableChains: MainnetChainIds[] = [
+  //       "cosmoshub-4",
+  //       "osmosis-1",
+  //       "stride-1",
+  //       "neutron-1",
+  //       "axelar-dojo-1",
+  //       "laozi-mainnet",
+  //       "columbus-5",
+  //       "phoenix-1",
+  //       "evmos_9001-2",
+  //       "injective-1",
+  //       "stargaze-1",
+  //       "crypto-org-chain-mainnet-1",
+  //       "kava_2222-10",
+  //     ];
+  //     return trustAvailableChains.includes(chainId as MainnetChainIds);
+  //   },
+  //   stakeUrl: "https://trustwallet.com/staking",
+  //   governanceUrl: "https://governance.trustwallet.com/",
+  //   features: [],
+  //   mode: "extension", // Add mode property with correct value
+  // },
+  {
+    ...CosmosKitWalletList["cdcwallet-extension"],
+    logo: "/wallets/crypto-com.png",
+    lazyInstall: walletInstallers["cdcwallet-extension"],
+    mobileDisabled: false,
+    async supportsChain(chainId) {
+      const cdcAvailableChains: MainnetChainIds[] = [
+        "cosmoshub-4",
+        "osmosis-1",
+        "crypto-org-chain-mainnet-1",
+      ];
+      return cdcAvailableChains.includes(chainId as MainnetChainIds);
+    },
+    windowPropertyName: "cdc_wallet",
+    stakeUrl: "https://crypto.com/staking",
+    features: [],
+    mode: "extension",
+  },
+  {
+    ...CosmosKitWalletList["xdefi-extension"],
+    logo: "/wallets/xdefi.png",
+    lazyInstall: walletInstallers["xdefi-extension"],
+    windowPropertyName: "xfi",
+    async supportsChain(chainId) {
+      if (typeof window === "undefined") return true;
+
+      const xfiWallet = (window as any)?.xfi?.keplr as {
+        getKey: (chainId: string) => Promise<boolean>;
+      };
+
+      if (!xfiWallet) return true;
+
+      return xfiWallet
+        .getKey(chainId)
+        .then(() => true)
+        .catch(() => false);
+    },
+    features: [],
+  },
+  {
+    ...CosmosKitWalletList["station-extension"],
+    mobileDisabled: true,
+    logo: "/wallets/station.svg",
+    lazyInstall: walletInstallers["station-extension"],
+    windowPropertyName: "station",
+    supportsChain: async (chainId) => {
+      if (typeof window === "undefined") return true;
+
+      const stationWallet = (window as any)?.station?.keplr as {
+        getChainInfosWithoutEndpoints: () => Promise<{ chainId: string }[]>;
+      };
+
+      if (!stationWallet) return true;
+
+      const chainInfos = await stationWallet.getChainInfosWithoutEndpoints();
+      return chainInfos.some((info) => info.chainId === chainId);
+    },
+    signOptions: {
+      preferNoSetFee: true,
+    },
+    features: [],
+  },
+];

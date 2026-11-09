@@ -1,0 +1,541 @@
+import { DEFAULT_VS_CURRENCY } from "@osmosis-labs/server";
+import { Currency } from "@osmosis-labs/types";
+import { CoinPretty, Dec, DecUtils, PricePretty } from "@osmosis-labs/unit";
+import {
+  AmountTooSmallError,
+  isValidNumericalRawInput,
+} from "@osmosis-labs/utils";
+import { act, waitFor } from "@testing-library/react";
+
+import { server, trpcQuery } from "~/__tests__/msw";
+import {
+  connectTestWallet,
+  renderHookWithProviders,
+} from "~/__tests__/test-utils";
+import { ChainList } from "~/config/generated/chain-list";
+
+import { useAmountInput } from "../use-amount-input";
+
+describe("useAmountInput", () => {
+  const osmoMockCurrency: Currency = {
+    coinDenom: "OSMO",
+    coinMinimalDenom: "uosmo",
+    coinDecimals: 6,
+  };
+
+  beforeEach(() => {
+    server.use(
+      trpcQuery(
+        "edge.assets.getAssetPrice",
+        () => new PricePretty(DEFAULT_VS_CURRENCY, new Dec(1))
+      ),
+      trpcQuery("local.balances.getUserBalances", () => [
+        {
+          denom: osmoMockCurrency.coinMinimalDenom,
+          amount: "1000000000",
+          coin: undefined,
+        },
+      ])
+    );
+  });
+
+  it("initializes with default values", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    expect(result.current.debouncedInAmount).toBeNull();
+    expect(result.current.amount).toBeUndefined();
+    expect(result.current.balance).toBeUndefined();
+    expect(result.current.fiatValue).toBeUndefined();
+    expect(result.current.price).toBeUndefined();
+    expect(result.current.error).toEqual(new Error("Empty amount"));
+    expect(result.current.isTyping).toBe(false);
+    expect(result.current.isEmpty).toBe(true);
+  });
+
+  it("sets amount correctly", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency })
+    );
+
+    act(() => {
+      result.current.setAmount("10");
+    });
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("10");
+    });
+
+    expect(result.current.amount).toBeInstanceOf(CoinPretty);
+    expect(result.current.amount?.toDec().toString()).toEqual(
+      "10.000000000000000000"
+    );
+  });
+
+  it("caps the input at the asset's decimals, not a fixed 6", async () => {
+    const { result, rerender } = renderHookWithProviders(
+      (props: { currency: Currency }) =>
+        useAmountInput({ currency: props.currency }),
+      { initialProps: { currency: osmoMockCurrency } }
+    );
+
+    act(() => result.current.setAmount("1,123456"));
+    await waitFor(() => expect(result.current.inputAmount).toBe("1.123456"));
+    act(() => result.current.setAmount("1.1234567"));
+    expect(result.current.inputAmount).toBe("1.123456");
+
+    const eighteen: Currency = { ...osmoMockCurrency, coinDecimals: 18 };
+    rerender({ currency: eighteen });
+    act(() => result.current.setAmount("0.123456789012345678"));
+    await waitFor(() =>
+      expect(result.current.inputAmount).toBe("0.123456789012345678")
+    );
+  });
+
+  it("reports an amount below one base unit as too small, not empty", async () => {
+    const eighteen: Currency = { ...osmoMockCurrency, coinDecimals: 18 };
+    const { result, rerender } = renderHookWithProviders(
+      (props: { currency: Currency }) =>
+        useAmountInput({ currency: props.currency }),
+      { initialProps: { currency: eighteen } }
+    );
+
+    act(() => result.current.setAmount("0.0000001"));
+    await waitFor(() => expect(result.current.inputAmount).toBe("0.0000001"));
+    expect(result.current.error).not.toBeInstanceOf(AmountTooSmallError);
+
+    rerender({ currency: osmoMockCurrency });
+    await waitFor(() =>
+      expect(result.current.error).toBeInstanceOf(AmountTooSmallError)
+    );
+  });
+
+  it("handles invalid input", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency })
+    );
+
+    act(() => {
+      result.current.setAmount("invalid");
+    });
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+    expect(result.current.error).toEqual(new Error("Empty amount"));
+
+    act(() => {
+      result.current.setAmount("-10");
+    });
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    expect(result.current.error).toEqual(new Error("Empty amount"));
+  });
+
+  it("calculates max amount considering gas", async () => {
+    const mockGasAmount = new CoinPretty(
+      osmoMockCurrency,
+      new Dec(1).mul(DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals))
+    ); // 1 OSMO for gas
+
+    const { result, rootStore } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency, gasAmount: mockGasAmount })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    await connectTestWallet({
+      walletRuntime: rootStore.walletRuntime,
+      chainId: ChainList[0].chain_id,
+    });
+
+    act(() => {
+      result.current.toggleMax();
+    });
+
+    await waitFor(() => {
+      expect(result.current.fraction).toBe(1);
+      expect(result.current.isMaxValue).toBe(true);
+      expect(result.current.isHalfValue).toBe(false);
+      expect(result.current.inputAmount).toBe("999");
+    });
+
+    // if the user inputs the balance greater than the fee, he should see an error
+    act(() => {
+      result.current.setAmount("1000");
+    });
+
+    await waitFor(() => {
+      expect(result.current.fraction).toBe(null);
+      expect(result.current.isMaxValue).toBe(false);
+      expect(result.current.isHalfValue).toBe(false);
+      expect(result.current.inputAmount).toBe("1000");
+    });
+
+    await waitFor(() => {
+      expect(result.current.error).toEqual(
+        new Error("Insufficient balance for fee")
+      );
+    });
+
+    // If we set the amount to the max amount manually, isMaxValue should be true
+    act(() => {
+      result.current.setAmount("999");
+    });
+
+    await waitFor(() => {
+      expect(result.current.fraction).toBe(null);
+      expect(result.current.isMaxValue).toBe(true);
+      expect(result.current.isHalfValue).toBe(false);
+      expect(result.current.inputAmount).toBe("999");
+    });
+  });
+
+  it("calculates max amount but does not consider gas if 'gasAmount' currency does not match currency", async () => {
+    const mockGasAmount = new CoinPretty(
+      { ...osmoMockCurrency, coinDenom: "ATOM", coinMinimalDenom: "uatom" },
+      new Dec(1).mul(DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals))
+    ); // 1 ATOM for gas
+
+    const { result, rootStore } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency, gasAmount: mockGasAmount })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    await connectTestWallet({
+      walletRuntime: rootStore.walletRuntime,
+      chainId: ChainList[0].chain_id,
+    });
+
+    act(() => {
+      result.current.toggleMax();
+    });
+
+    await waitFor(() => {
+      expect(result.current.isMaxValue).toBe(true);
+      expect(result.current.inputAmount).toBe("1000");
+    });
+  });
+
+  it("calculates half amount", async () => {
+    const mockGasAmount = new CoinPretty(
+      osmoMockCurrency,
+      new Dec(1).mul(DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals))
+    ); // 1 OSMO for gas
+
+    const { result, rootStore } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency, gasAmount: mockGasAmount })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    await connectTestWallet({
+      walletRuntime: rootStore.walletRuntime,
+      chainId: ChainList[0].chain_id,
+    });
+
+    act(() => {
+      result.current.toggleHalf();
+    });
+
+    await waitFor(() => {
+      expect(result.current.isMaxValue).toBe(false);
+      expect(result.current.isHalfValue).toBe(true);
+
+      // Even though there's gas, half of the remaining balance should be calculated
+      expect(result.current.inputAmount).toBe("500");
+    });
+
+    // If we set the amount to the max amount manually, isHalfValue should be true
+    act(() => {
+      result.current.setAmount("500");
+    });
+
+    await waitFor(() => {
+      expect(result.current.fraction).toBe(null);
+      expect(result.current.isMaxValue).toBe(false);
+      expect(result.current.isHalfValue).toBe(true);
+      expect(result.current.inputAmount).toBe("500");
+    });
+  });
+
+  it("calculates quarter amount", async () => {
+    const mockGasAmount = new CoinPretty(
+      osmoMockCurrency,
+      new Dec(1).mul(DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals))
+    );
+
+    const { result, rootStore } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency, gasAmount: mockGasAmount })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    await connectTestWallet({
+      walletRuntime: rootStore.walletRuntime,
+      chainId: ChainList[0].chain_id,
+    });
+
+    act(() => {
+      result.current.setFraction(0.25);
+    });
+
+    await waitFor(() => {
+      expect(result.current.isMaxValue).toBe(false);
+      expect(result.current.isHalfValue).toBe(false);
+      expect(result.current.isQuarterValue).toBe(true);
+      expect(result.current.isThreeQuartersValue).toBe(false);
+      expect(result.current.inputAmount).toBe("250");
+    });
+
+    // amount-vs-balance fallback: manual entry equal to balance * 0.25 should
+    // still light up isQuarterValue after the fraction is cleared.
+    act(() => {
+      result.current.setAmount("250");
+    });
+
+    await waitFor(() => {
+      expect(result.current.fraction).toBe(null);
+      expect(result.current.isQuarterValue).toBe(true);
+    });
+  });
+
+  it("calculates three-quarters amount", async () => {
+    const mockGasAmount = new CoinPretty(
+      osmoMockCurrency,
+      new Dec(1).mul(DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals))
+    );
+
+    const { result, rootStore } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency, gasAmount: mockGasAmount })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    await connectTestWallet({
+      walletRuntime: rootStore.walletRuntime,
+      chainId: ChainList[0].chain_id,
+    });
+
+    act(() => {
+      result.current.setFraction(0.75);
+    });
+
+    await waitFor(() => {
+      expect(result.current.isMaxValue).toBe(false);
+      expect(result.current.isHalfValue).toBe(false);
+      expect(result.current.isQuarterValue).toBe(false);
+      expect(result.current.isThreeQuartersValue).toBe(true);
+      expect(result.current.inputAmount).toBe("750");
+    });
+
+    act(() => {
+      result.current.setAmount("750");
+    });
+
+    await waitFor(() => {
+      expect(result.current.fraction).toBe(null);
+      expect(result.current.isThreeQuartersValue).toBe(true);
+    });
+  });
+
+  it("updates isTyping and debouncedInAmount correctly", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+
+    act(() => {
+      result.current.setAmount("123");
+    });
+
+    await waitFor(() => {
+      expect(result.current.debouncedInAmount).toEqual(
+        new CoinPretty(
+          osmoMockCurrency,
+          new Dec(123).mul(
+            DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals)
+          )
+        )
+      );
+    });
+
+    act(() => {
+      result.current.setAmount("1234");
+    });
+
+    // Immediately after setting, isTyping should be true
+    await waitFor(() => {
+      expect(result.current.isTyping).toBe(true);
+    });
+
+    // Wait for the debounce to settle
+    await waitFor(() => {
+      expect(result.current.debouncedInAmount).toEqual(
+        new CoinPretty(
+          osmoMockCurrency,
+          new Dec(1234).mul(
+            DecUtils.getTenExponentN(osmoMockCurrency.coinDecimals)
+          )
+        )
+      );
+    });
+
+    // After debounce, isTyping should be false
+    expect(result.current.isTyping).toBe(false);
+  });
+
+  it("calculates fiatValue and price correctly", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency })
+    );
+
+    act(() => {
+      result.current.setAmount("100");
+    });
+
+    await waitFor(() => {
+      expect(result.current.amount).toBeInstanceOf(CoinPretty);
+      expect(result.current.amount?.toDec().toString()).toEqual(
+        "100.000000000000000000"
+      );
+    });
+
+    // Assuming the price of OSMO is 1 in the default vs currency
+    await waitFor(() => {
+      expect(result.current.price?.toString()).toEqual("$1");
+    });
+    // Fiat value should be the amount (100 OSMO) times the price (1)
+    expect(result.current.fiatValue?.toString()).toEqual("$100");
+  });
+
+  it("resets input and fraction correctly", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({ currency: osmoMockCurrency })
+    );
+
+    // Set some values first
+    act(() => {
+      result.current.setAmount("50");
+      result.current.setFraction(0.5);
+    });
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("50");
+      expect(result.current.fraction).toBe(0.5);
+    });
+
+    // Now reset
+    act(() => {
+      result.current.reset();
+    });
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+      expect(result.current.fraction).toBeNull();
+      expect(result.current.amount).toBeUndefined();
+      expect(result.current.debouncedInAmount).toBeNull();
+    });
+  });
+
+  it("uses the balance override instead of the wallet balance", async () => {
+    const { result, rootStore } = renderHookWithProviders(() =>
+      useAmountInput({
+        currency: osmoMockCurrency,
+        balanceOverride: { amount: "40000000", isFetched: true },
+      })
+    );
+
+    await connectTestWallet({
+      walletRuntime: rootStore.walletRuntime,
+      chainId: ChainList[0].chain_id,
+    });
+
+    act(() => {
+      result.current.toggleMax();
+    });
+
+    await waitFor(() => {
+      expect(result.current.balance?.toCoin().amount).toBe("40000000");
+      expect(result.current.inputAmount).toBe("40");
+    });
+
+    act(() => {
+      result.current.setAmount("41");
+    });
+
+    await waitFor(() => {
+      expect(result.current.error).toEqual(new Error("Insufficient balance"));
+    });
+  });
+
+  it("has no balance while the override loads", async () => {
+    const { result } = renderHookWithProviders(() =>
+      useAmountInput({
+        currency: osmoMockCurrency,
+        balanceOverride: { amount: undefined, isFetched: false },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.inputAmount).toBe("");
+    });
+    expect(result.current.balance).toBeUndefined();
+  });
+});
+
+describe("isValidNumericalRawInput", () => {
+  it("should return true for valid positive numbers", () => {
+    expect(isValidNumericalRawInput("123")).toBe(true);
+    expect(isValidNumericalRawInput("0.456")).toBe(true);
+    expect(isValidNumericalRawInput("7890")).toBe(true);
+  });
+
+  it("should return true for zero", () => {
+    expect(isValidNumericalRawInput("0")).toBe(true);
+  });
+
+  it("should return false for negative numbers", () => {
+    expect(isValidNumericalRawInput("-1")).toBe(false);
+    expect(isValidNumericalRawInput("-0.1")).toBe(false);
+  });
+
+  it("should return false for non-numeric strings", () => {
+    expect(isValidNumericalRawInput("abc")).toBe(false);
+    expect(isValidNumericalRawInput("12abc34")).toBe(false);
+  });
+
+  it("should return true for empty string", () => {
+    expect(isValidNumericalRawInput("")).toBe(true);
+  });
+
+  it("should return false for numbers exceeding MAX_SAFE_INTEGER", () => {
+    expect(isValidNumericalRawInput("9007199254740992")).toBe(false); // MAX_SAFE_INTEGER + 1
+  });
+
+  it("should return true for MAX_SAFE_INTEGER", () => {
+    expect(isValidNumericalRawInput("9007199254740991")).toBe(true); // MAX_SAFE_INTEGER
+  });
+});

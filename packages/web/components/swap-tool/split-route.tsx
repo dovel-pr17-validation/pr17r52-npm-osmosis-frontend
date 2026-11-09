@@ -1,0 +1,262 @@
+import { FloatingDelayGroup } from "@floating-ui/react";
+import { AppCurrency, Currency, RatePretty } from "@osmosis-labs/unit";
+import classNames from "classnames";
+import Image from "next/image";
+import Link from "next/link";
+import { useRouter } from "next/router";
+import { FunctionComponent, memo } from "react";
+
+import { Icon } from "~/components/assets";
+import { Tooltip } from "~/components/tooltip";
+import { CustomClasses } from "~/components/types";
+import { EntityImage } from "~/components/ui/entity-image";
+import { findOsmosisCurrency } from "~/config/chain";
+import { useTranslation, useWindowSize } from "~/hooks";
+import { getLogoURIs } from "~/utils/logo-uri";
+import type { RouterOutputs } from "~/utils/trpc";
+
+type SplitOutGivenIn =
+  RouterOutputs["local"]["quoteRouter"]["routeTokenOutGivenIn"]["split"];
+type SplitInGivenOut =
+  RouterOutputs["local"]["quoteRouter"]["routeTokenInGivenOut"]["split"];
+type Route = SplitOutGivenIn[number] | SplitInGivenOut[number];
+type RouteInGivenOut = SplitInGivenOut[number];
+type RouteOutGivenIn = SplitOutGivenIn[number];
+type RouteWithPercentage = (RouteInGivenOut | SplitOutGivenIn[number]) & {
+  percentage?: RatePretty;
+};
+
+export const RouteLane: FunctionComponent<{
+  route: RouteWithPercentage;
+}> = memo(({ route }) => {
+  // The route's own hop currencies come from the asset list, as the pool
+  // tooltips use them. The static chain config is only a fallback: it misses
+  // assets (PHOTON) and carries short symbols (USDC.noble as "USDC.n") that
+  // don't map to an icon.
+  const sendCurrency =
+    route.pools[0]?.inCurrency ??
+    ((route as RouteOutGivenIn).tokenInDenom
+      ? findOsmosisCurrency((route as RouteOutGivenIn).tokenInDenom)
+      : findOsmosisCurrency((route as RouteInGivenOut).tokenInDenoms[0]));
+  const lastOutCurrency =
+    route.pools[route.pools.length - 1]?.outCurrency ??
+    ((route as RouteInGivenOut).tokenOutDenom
+      ? findOsmosisCurrency((route as RouteInGivenOut).tokenOutDenom)
+      : findOsmosisCurrency(
+          (route as RouteOutGivenIn).tokenOutDenoms[
+            (route as RouteOutGivenIn).tokenOutDenoms.length - 1
+          ]
+        ));
+
+  if (!sendCurrency || !lastOutCurrency) return null;
+
+  return (
+    <div className="flex items-center justify-between rounded-full bg-osmoverse-1000 py-1 pl-3 pr-1">
+      <div className="flex shrink-0 items-center gap-3 text-center">
+        {route.percentage && (
+          <span className="body2 w-10 text-left text-osmoverse-200">
+            {route.percentage.inequalitySymbol(false).maxDecimals(0).toString()}
+          </span>
+        )}
+        <div className="h-7 w-7">
+          <DenomImage currency={sendCurrency} size={28} />
+        </div>
+      </div>
+
+      <div className="relative flex w-full items-center justify-center">
+        <div className="relative flex w-full items-center gap-1">
+          <Dots className="animate-[pulse_3s_ease-in-out_0.1s_infinite]" />
+          <Dots className="animate-[pulse_3s_ease-in-out_0.4s_infinite]" />
+          <Dots className="animate-[pulse_3s_ease-in-out_0.7s_infinite]" />
+          <Dots className="animate-[pulse_3s_ease-in-out_1s_infinite]" />
+        </div>
+
+        <Pools {...route} />
+      </div>
+
+      <div className="h-7 w-7 shrink-0">
+        <DenomImage currency={lastOutCurrency} size={28} />
+      </div>
+    </div>
+  );
+});
+
+const Dots: FunctionComponent<CustomClasses> = ({ className }) => (
+  <hr
+    className={classNames(
+      "h-[1px] w-1/4 border-t-2 border-dashed border-t-wosmongton-400",
+      className
+    )}
+  />
+);
+
+const Pools: FunctionComponent<Route> = memo(({ pools }) => {
+  const { isMobile } = useWindowSize();
+  const router = useRouter();
+
+  const { t } = useTranslation();
+
+  return (
+    // Only one pool tooltip is open at a time while hovering across the route.
+    <FloatingDelayGroup delay={0}>
+      <div className="absolute flex w-full justify-evenly">
+        {pools.map(
+          (
+            {
+              id,
+              type,
+              inCurrency,
+              outCurrency,
+              spreadFactor,
+              dynamicSpreadFactor,
+            },
+            index
+          ) => (
+            <Tooltip
+              key={`${id}${index}`}
+              // Taps open the tooltip on mobile, where the chip itself doesn't
+              // navigate, so the pool id link inside it must be tappable.
+              interactive={isMobile}
+              content={
+                <div className="space-y-3">
+                  {inCurrency && outCurrency && (
+                    <div className="flex space-x-2">
+                      <div className="flex">
+                        <div className="h-[20px] w-[20px]">
+                          <DenomImage currency={inCurrency} size={20} />
+                        </div>
+                        <div className="-ml-3 h-[20px] w-[20px]">
+                          <DenomImage currency={outCurrency} size={20} />
+                        </div>
+                      </div>
+
+                      <p className="space-x-1.5 text-base font-semibold">
+                        <span>{inCurrency.coinDenom}</span>
+                        <span className="text-osmoverse-400">/</span>
+                        <span>{outCurrency.coinDenom}</span>
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="flex justify-center space-x-1 text-center text-xs font-medium">
+                    {isMobile ? (
+                      <Link
+                        href={"/pool/" + id}
+                        className="w-full whitespace-nowrap rounded-md bg-osmoverse-800 px-1.5 py-0.5 text-wosmongton-300 underline"
+                      >
+                        {t("swap.pool", { id })}
+                      </Link>
+                    ) : (
+                      <p className="w-full whitespace-nowrap rounded-md bg-osmoverse-800 px-1.5 py-0.5">
+                        {t("swap.pool", { id })}
+                      </p>
+                    )}
+
+                    {spreadFactor && (
+                      <p className="w-full whitespace-nowrap rounded-md bg-osmoverse-800 px-1.5 py-0.5">
+                        {type === "concentrated"
+                          ? t("swap.routerTooltipSpreadFactor")
+                          : t("swap.routerTooltipFee")}{" "}
+                        {dynamicSpreadFactor
+                          ? t("swap.dynamicSpreadFactor")
+                          : spreadFactor.maxDecimals(2).toString()}
+                      </p>
+                    )}
+                  </div>
+                  {(type === "concentrated" ||
+                    type === "stable" ||
+                    type === "cosmwasm-transmuter" ||
+                    type === "cosmwasm-alloyed" ||
+                    type === "cosmwasm-astroport-pcl" ||
+                    type === "cosmwasm-whitewhale" ||
+                    type === "cosmwasm") && (
+                    <div className="flex items-center justify-center gap-1 space-x-1 text-center text-xs font-medium text-ion-400">
+                      {type === "concentrated" && (
+                        <Icon id="lightning-small" height={16} width={16} />
+                      )}
+                      {(type === "stable" ||
+                        type === "cosmwasm-transmuter" ||
+                        type === "cosmwasm-alloyed") && (
+                        <Image
+                          alt="stable-pool"
+                          src="/icons/stableswap-pool.svg"
+                          width={16}
+                          height={16}
+                        />
+                      )}
+                      {type === "cosmwasm" && (
+                        <Icon id="setting" height={16} width={16} />
+                      )}
+                      {t(
+                        type === "concentrated"
+                          ? "clPositions.supercharged"
+                          : type === "cosmwasm-transmuter" ||
+                              type === "cosmwasm-alloyed"
+                            ? "pool.transmuter"
+                            : type === "cosmwasm-astroport-pcl"
+                              ? "Astroport PCL"
+                              : type === "cosmwasm-whitewhale"
+                                ? "Skeleton Swap"
+                                : type === "cosmwasm"
+                                  ? "pool.custom"
+                                  : "pool.stableswapEnabled"
+                      )}
+                    </div>
+                  )}
+                </div>
+              }
+            >
+              <button
+                className="flex items-center gap-1 rounded-full bg-osmoverse-800 py-1 px-2 hover:bg-osmoverse-700"
+                onClick={() => {
+                  if (!isMobile) router.push("/pool/" + id);
+                }}
+              >
+                {inCurrency && outCurrency && (
+                  <div className="flex">
+                    <div className="h-[20px] w-[20px]">
+                      <DenomImage currency={inCurrency} />
+                    </div>
+                    <div className="-ml-3 h-[20px] w-[20px]">
+                      <DenomImage currency={outCurrency} />
+                    </div>
+                  </div>
+                )}
+
+                {pools.length < 4 &&
+                  !isMobile &&
+                  spreadFactor &&
+                  !dynamicSpreadFactor && (
+                    <p className="text-caption">
+                      {spreadFactor.maxDecimals(2).toString()}
+                    </p>
+                  )}
+              </button>
+            </Tooltip>
+          )
+        )}
+      </div>
+    </FloatingDelayGroup>
+  );
+});
+
+const DenomImage: FunctionComponent<{
+  currency: AppCurrency | Currency;
+  /** Size in px */
+  size?: number;
+}> = ({ currency, size = 20 }) => {
+  return (
+    <div
+      className="shrink-0 overflow-hidden rounded-full"
+      style={{ width: size, height: size }}
+    >
+      <EntityImage
+        logoURIs={getLogoURIs(currency.coinImageUrl)}
+        name={currency.coinDenom}
+        symbol={currency.coinDenom}
+        width={size}
+        height={size}
+      />
+    </div>
+  );
+};

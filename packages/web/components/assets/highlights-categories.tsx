@@ -1,0 +1,410 @@
+import classNames from "classnames";
+import Link from "next/link";
+import { FunctionComponent, ReactNode, useMemo } from "react";
+
+import { PriceChange } from "~/components/assets/price";
+import { SkeletonLoader } from "~/components/loaders/skeleton-loader";
+import { EntityImage } from "~/components/ui/entity-image";
+import { Breakpoint, useTranslation, useWindowSize } from "~/hooks";
+import { getLogoURIs } from "~/utils/logo-uri";
+import { api, RouterOutputs } from "~/utils/trpc";
+
+import { CustomClasses } from "../types";
+
+type PriceChange24hAsset =
+  | RouterOutputs["edge"]["assets"]["getTopNewAssets"][number]
+  | RouterOutputs["edge"]["assets"]["getTopGainerAssets"][number];
+
+type UpcomingReleaseAsset =
+  RouterOutputs["edge"]["assets"]["getTopUpcomingAssets"][number];
+
+type HighlightsProps = {
+  isCategorySelected: boolean;
+  onSelectAllTopGainers: () => void;
+} & CustomClasses;
+
+export const HighlightsCategories: FunctionComponent<HighlightsProps> = (
+  props
+) => {
+  if (props.isCategorySelected) return null;
+
+  return <HighlightsGrid {...props} />;
+};
+
+/**
+ * Checks if an upcoming asset has a specific enough launch date to be shown.
+ * Returns true for dates with day, month, or quarter (e.g., "March 2024", "Q2 2024", "March 22, 2024").
+ * Returns false for vague dates like "soon", "H1 2024" (half year), or just "2024" (year only).
+ */
+function hasSpecificLaunchDate(dateText: string | undefined): boolean {
+  if (!dateText) return false;
+
+  const lowerDate = dateText.toLowerCase().trim();
+
+  // Explicit filler values
+  if (lowerDate === "soon" || lowerDate === "tbd" || lowerDate === "tba") {
+    return false;
+  }
+
+  // Half-year format (H1, H2)
+  if (/^h[12]\s*\d{4}$/i.test(lowerDate)) {
+    return false;
+  }
+
+  // Year only (just "2024", "2025", etc.)
+  if (/^\d{4}$/.test(lowerDate)) {
+    return false;
+  }
+
+  // Check for month names (full or abbreviated) - these are specific enough
+  const hasMonth =
+    /(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(
+      lowerDate
+    );
+  if (hasMonth) return true;
+
+  // Check for quarter (Q1, Q2, Q3, Q4) - these are specific enough
+  const hasQuarter = /q[1-4]\s*\d{4}/i.test(lowerDate);
+  if (hasQuarter) return true;
+
+  // Default to false for any other format
+  return false;
+}
+
+const HighlightsGrid: FunctionComponent<HighlightsProps> = ({
+  onSelectAllTopGainers,
+  className,
+}) => {
+  const { t } = useTranslation();
+  const { width } = useWindowSize();
+
+  const isLargeTablet = width < Breakpoint.xl && width > Breakpoint.lg;
+
+  const { data: topNewAssets, isLoading: isTopNewAssetsLoading } =
+    api.edge.assets.getTopNewAssets.useQuery({
+      topN: isLargeTablet ? 3 : undefined,
+    });
+  const { data: topUpcomingAssets, isLoading: isTopUpcomingAssetsLoading } =
+    api.edge.assets.getTopUpcomingAssets.useQuery({
+      topN: isLargeTablet ? 3 : undefined,
+    });
+
+  const hasNewAssets =
+    !isTopNewAssetsLoading && (topNewAssets ?? []).length > 0;
+
+  // Filter upcoming assets to only include those with specific launch dates
+  const qualifyingUpcomingAssets = (topUpcomingAssets ?? []).filter((asset) =>
+    hasSpecificLaunchDate(asset.estimatedLaunchDateUtc)
+  );
+  const hasQualifyingUpcomingAssets =
+    !isTopUpcomingAssetsLoading && qualifyingUpcomingAssets.length > 0;
+
+  // Top Gainers is the only tile next to the conditional New and Upcoming ones.
+  const isGainersOnly = !hasNewAssets && !hasQualifyingUpcomingAssets;
+
+  // Top Gainers row count by its own layout (New/Upcoming always fetch 3):
+  //  - gainers-only: full width, 6 rows across two columns (3 per column)
+  //  - large-tablet snap carousel: 6 in a single-column swipe card
+  //  - desktop multi-tile single-column card: 3
+  //
+  // Only switch the count once New/Upcoming have settled. While they load,
+  // `isGainersOnly` is transiently true (their `has*` flags are false), and
+  // letting that drive `topN` would change the query key mid-load, discarding
+  // the cache hit and forcing a redundant refetch when data arrives.
+  const isHighlightLayoutSettled =
+    !isTopNewAssetsLoading && !isTopUpcomingAssetsLoading;
+  const topGainerCount =
+    isLargeTablet || (isHighlightLayoutSettled && isGainersOnly) ? 6 : 3;
+  const { data: topGainerAssets, isLoading: isTopGainerAssetsLoading } =
+    api.edge.assets.getTopGainerAssets.useQuery(
+      { topN: topGainerCount },
+      // A failing server times out after about 12 s; one retry is enough.
+      { retry: 1 }
+    );
+  // Hidden when it has nothing to show, e.g. while market data is unavailable.
+  const hasTopGainers =
+    isTopGainerAssetsLoading || (topGainerAssets ?? []).length > 0;
+
+  // Drive the grid layout off the count of visible tiles so the row reflows to
+  // fill the freed space instead of leaving a gap.
+  const visibleTileCount =
+    (hasTopGainers ? 1 : 0) +
+    (hasNewAssets ? 1 : 0) +
+    (hasQualifyingUpcomingAssets ? 1 : 0);
+  if (visibleTileCount === 0) return null;
+
+  return (
+    <div
+      className={classNames(
+        "lg:no-scrollbar grid gap-6 xl:gap-8 lg:flex lg:snap-x lg:snap-mandatory lg:overflow-x-scroll",
+        {
+          // Gainers-only: single column, no row span.
+          "grid-cols-1": visibleTileCount === 1,
+          // Two tiles: 2 columns. Top Gainers spans 2 rows on xl; without it the two
+          // tiles share one row, so no second row is reserved.
+          "grid-cols-2": visibleTileCount === 2,
+          "xl:grid-rows-2": visibleTileCount === 2 && hasTopGainers,
+          // Three tiles: 3 columns collapsing to 2x2 on xl.
+          "grid-cols-3 xl:grid-cols-2 xl:grid-rows-2": visibleTileCount === 3,
+        },
+        className
+      )}
+    >
+      {hasNewAssets && (
+        <AssetHighlights
+          className="lg:w-[80%] lg:shrink-0 lg:snap-center"
+          title={t("assets.highlights.new")}
+          isLoading={isTopNewAssetsLoading}
+          assets={(topNewAssets ?? []).map(highlightPrice24hChangeAsset)}
+        />
+      )}
+      {hasTopGainers && (
+        <AssetHighlights
+          className={classNames({
+            // Multi-tile: 80% width snap card; span 2 rows on xl to share the
+            // second row with New / Upcoming.
+            "lg:w-[80%] lg:shrink-0 lg:snap-center": !isGainersOnly,
+            "xl:row-span-2 lg:row-auto": visibleTileCount > 1,
+            // Gainers-only: full width, rows flow into two columns.
+            "w-full": isGainersOnly,
+          })}
+          title={t("assets.highlights.topGainers")}
+          subtitle="24h"
+          isLoading={isTopGainerAssetsLoading}
+          assets={(topGainerAssets ?? []).map(highlightPrice24hChangeAsset)}
+          onClickSeeAll={onSelectAllTopGainers}
+          columns={isGainersOnly ? 2 : 1}
+        />
+      )}
+      {hasQualifyingUpcomingAssets && (
+        <AssetHighlights
+          className="lg:w-[80%] lg:shrink-0 lg:snap-center"
+          title={t("assets.highlights.upcoming")}
+          isLoading={isTopUpcomingAssetsLoading}
+          assets={qualifyingUpcomingAssets.map(highlightUpcomingReleaseAsset)}
+        />
+      )}
+    </div>
+  );
+};
+
+export function highlightPrice24hChangeAsset(asset: PriceChange24hAsset) {
+  return {
+    asset: {
+      ...asset,
+      href: `/assets/${asset.coinMinimalDenom}`,
+    },
+    extraInfo: asset.priceChange24h ? (
+      <PriceChange
+        priceChange={asset.priceChange24h}
+        overrideTextClasses="body2"
+        className="h-fit"
+      />
+    ) : null,
+  };
+}
+
+function highlightUpcomingReleaseAsset(asset: UpcomingReleaseAsset) {
+  // Format the date to "Est. MMM YYYY" format
+  const formatDateText = (dateText: string | undefined) => {
+    if (!dateText) return null;
+
+    // Handle different date formats
+    let formattedDate = dateText;
+
+    // Convert month names to 3-letter codes with proper capitalization
+    const monthMap: { [key: string]: string } = {
+      January: "Jan",
+      February: "Feb",
+      March: "Mar",
+      April: "Apr",
+      May: "May",
+      June: "Jun",
+      July: "Jul",
+      August: "Aug",
+      September: "Sep",
+      October: "Oct",
+      November: "Nov",
+      December: "Dec",
+    };
+
+    // Replace full month names with 3-letter codes (case-insensitive)
+    Object.entries(monthMap).forEach(([full, short]) => {
+      formattedDate = formattedDate.replace(
+        new RegExp(`\\b${full}\\b`, "gi"),
+        short
+      );
+    });
+
+    return formattedDate;
+  };
+
+  return {
+    asset: {
+      coinDenom: asset.symbol,
+      coinName: asset.assetName,
+      coinImageUrl: asset.images[0].png ?? asset.images[0].svg,
+      href: asset.socials?.website,
+      externalLink: true,
+    },
+    extraInfo: asset.estimatedLaunchDateUtc ? (
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="body2 text-osmoverse-400 whitespace-nowrap">
+          Est. {formatDateText(asset.estimatedLaunchDateUtc)}
+        </span>
+      </div>
+    ) : null,
+  };
+}
+
+export const AssetHighlights: FunctionComponent<
+  {
+    title: string;
+    subtitle?: string;
+    onClickSeeAll?: () => void;
+    assets: {
+      asset: {
+        coinDenom: string;
+        coinName: string;
+        coinImageUrl?: string;
+      };
+      extraInfo: ReactNode;
+    }[];
+    isLoading?: boolean;
+    disableLinking?: boolean;
+    onClickAsset?: (asset: HighlightAsset) => void;
+    /**
+     * Number of columns to flow the asset rows into. Defaults to 1. Use 2 when
+     * the tile occupies the full width on its own, so the rows fill the
+     * horizontal space instead of stretching into one long list.
+     */
+    columns?: 1 | 2;
+  } & CustomClasses
+> = ({
+  title,
+  subtitle,
+  onClickSeeAll,
+  assets,
+  isLoading = false,
+  className,
+  onClickAsset,
+  columns = 1,
+}) => {
+  const { t } = useTranslation();
+
+  const skeletonCount = columns === 2 ? 6 : 3;
+
+  return (
+    <div
+      className={classNames(
+        "flex flex-col border-t border-osmoverse-700 py-3",
+        className
+      )}
+    >
+      <div className="flex place-content-between pt-1 pb-3">
+        <h6>
+          {title}{" "}
+          {subtitle && (
+            <span className="body1 text-osmoverse-400">{subtitle}</span>
+          )}
+        </h6>
+        {onClickSeeAll && (
+          <button className="body2 text-wosmongton-300" onClick={onClickSeeAll}>
+            {t("assets.seeAll")}
+          </button>
+        )}
+      </div>
+      <div
+        className={classNames({
+          "flex flex-col": columns === 1,
+          // NOTE: this repo's Tailwind screens are max-width, so unprefixed is
+          // the desktop base and `md:` applies at narrow widths. Two columns on
+          // desktop (where the tile spans full width on its own), collapsing to
+          // one column on small screens so rows never cramp.
+          "grid grid-cols-2 gap-x-8 md:grid-cols-1": columns === 2,
+          // gap-y only: tighten vertical spacing during load without
+          // overriding the column gap (gap-1 shorthand would clobber gap-x-8).
+          "gap-y-1": isLoading,
+        })}
+      >
+        {isLoading ? (
+          <>
+            {new Array(skeletonCount).fill(0).map((_, i) => (
+              <SkeletonLoader className="h-12 w-full" key={i} />
+            ))}
+          </>
+        ) : (
+          <>
+            {assets.map(({ asset, extraInfo }) => (
+              <AssetHighlightRow
+                key={asset.coinDenom}
+                asset={asset}
+                extraInfo={extraInfo}
+                onClick={onClickAsset}
+              />
+            ))}
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+type HighlightAsset = {
+  coinDenom: string;
+  coinName: string;
+  coinImageUrl?: string;
+  href?: string;
+  externalLink?: boolean;
+};
+
+const AssetHighlightRow: FunctionComponent<{
+  asset: HighlightAsset;
+  extraInfo: ReactNode;
+  onClick?: (asset: HighlightAsset) => void;
+}> = ({ asset, extraInfo, onClick }) => {
+  const { coinDenom, coinName, coinImageUrl, href, externalLink } = asset;
+  const logoURIs = useMemo(() => getLogoURIs(coinImageUrl), [coinImageUrl]);
+
+  const AssetContent = (
+    <>
+      <div className="flex items-center gap-2">
+        <div className="h-8 w-8 shrink-0 overflow-hidden rounded-full">
+          <EntityImage
+            symbol={coinDenom}
+            name={coinName}
+            logoURIs={logoURIs}
+            width={32}
+            height={32}
+          />
+        </div>
+        <span className="body2 max-w-[7rem] overflow-clip text-ellipsis whitespace-nowrap">
+          {coinName}
+        </span>
+        <span className="caption text-osmoverse-400">{coinDenom}</span>
+      </div>
+      <div>{extraInfo}</div>
+    </>
+  );
+
+  return !href ? (
+    <div
+      className="-mx-2 flex items-center justify-between gap-4 rounded-lg p-2"
+      onClick={() => onClick?.(asset)}
+    >
+      {AssetContent}
+    </div>
+  ) : (
+    <Link
+      href={href}
+      passHref
+      target={externalLink ? "_blank" : "_self"}
+      className="-mx-2 flex items-center justify-between gap-4 rounded-lg p-2 transition-colors duration-200 ease-in-out hover:cursor-pointer hover:bg-osmoverse-850"
+      onClick={() => {
+        onClick?.(asset);
+      }}
+    >
+      {AssetContent}
+    </Link>
+  );
+};

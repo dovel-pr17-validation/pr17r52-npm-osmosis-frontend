@@ -1,0 +1,128 @@
+import { DEFAULT_VS_CURRENCY } from "@osmosis-labs/server";
+import { CoinPretty, Dec, Int, PricePretty } from "@osmosis-labs/unit";
+import React, { FunctionComponent } from "react";
+
+import { LinkButton } from "~/components/buttons/link-button";
+import { EntityImage } from "~/components/ui/entity-image";
+import { useTranslation } from "~/hooks";
+import { useOrderbookOrders } from "~/hooks/limit-orders/use-orderbook";
+import { useWallet } from "~/hooks/use-wallet";
+import { formatFiatPrice, formatPretty } from "~/utils/formatter";
+
+const OPEN_ORDERS_LIMIT = 5;
+
+export const OpenOrders: FunctionComponent = () => {
+  const { t } = useTranslation();
+
+  const { address } = useWallet();
+
+  const { orders: openOrders, isLoading } = useOrderbookOrders({
+    userAddress: address ?? "",
+    pageSize: OPEN_ORDERS_LIMIT,
+    filter: "open",
+  });
+
+  const hasOpenOrders = openOrders?.length > 0;
+
+  if (isLoading || !hasOpenOrders) return null;
+
+  return (
+    <div className="flex w-full flex-col py-3">
+      <div className="flex items-center justify-between gap-3">
+        <h6 className="py-3">{t("portfolio.openOrders")}</h6>
+        <LinkButton
+          href="/transactions?tab=orders"
+          className="-mx-2 text-osmoverse-400"
+          label={t("portfolio.seeAll")}
+          ariaLabel={t("portfolio.seeAll")}
+          size="md"
+        />
+      </div>
+      <div className="w-full flex-col justify-between self-stretch">
+        {openOrders?.map(
+          (
+            { baseAsset, quoteAsset, order_direction, output, placed_quantity },
+            index
+          ) => {
+            // example: 0.01 OSMO
+            const formattedBuySellToken = formatPretty(
+              new CoinPretty(
+                {
+                  coinDecimals: baseAsset?.decimals ?? 0,
+                  coinDenom: baseAsset?.symbol ?? "",
+                  coinMinimalDenom: baseAsset?.coinMinimalDenom ?? "",
+                },
+                order_direction === "ask" ? placed_quantity : output
+              )
+            );
+
+            // example: $0.01
+            const formattedFiatPrice = formatFiatPrice(
+              new PricePretty(
+                DEFAULT_VS_CURRENCY,
+                order_direction === "bid"
+                  ? placed_quantity /
+                      Number(
+                        new Dec(10)
+                          .pow(new Int(quoteAsset?.decimals ?? 0))
+                          .toString()
+                      )
+                  : output.quo(
+                      new Dec(10).pow(new Int(quoteAsset?.decimals ?? 0))
+                    )
+              ),
+              2
+            );
+
+            // example: 0.01 USDC
+            const formattedQuoteAsset = formatPretty(
+              new CoinPretty(
+                {
+                  coinDecimals: quoteAsset?.decimals ?? 0,
+                  coinDenom: quoteAsset?.symbol ?? "",
+                  coinMinimalDenom: quoteAsset?.coinMinimalDenom ?? "",
+                },
+                order_direction === "ask" ? output : placed_quantity
+              )
+            );
+
+            const buySellText =
+              order_direction === "bid"
+                ? t("portfolio.buy")
+                : t("portfolio.sell");
+
+            return (
+              <div key={index} className="-mx-2 flex justify-between gap-4 p-2">
+                <div className="h-8 w-8 shrink-0 overflow-hidden rounded-full">
+                  <EntityImage
+                    width={32}
+                    height={32}
+                    logoURIs={
+                      baseAsset?.rawAsset.logoURIs ?? { png: undefined }
+                    }
+                    name={baseAsset?.rawAsset.name ?? ""}
+                    symbol={baseAsset?.rawAsset.symbol ?? ""}
+                  />
+                </div>
+                <div className="flex h-full flex-col justify-between overflow-hidden whitespace-nowrap">
+                  <span className="body2 overflow-hidden overflow-ellipsis">
+                    {buySellText} {baseAsset?.currency?.coinDenom}{" "}
+                  </span>
+                  <span className="caption overflow-hidden overflow-ellipsis text-osmoverse-300">
+                    {formattedBuySellToken}
+                  </span>
+                </div>
+                <div className="body2 ml-auto flex h-full flex-col justify-between overflow-ellipsis whitespace-nowrap text-right">
+                  {formattedFiatPrice}
+                  <span className="caption text-osmoverse-300">
+                    {formattedQuoteAsset}
+                  </span>
+                </div>
+              </div>
+            );
+          }
+        )}
+      </div>
+    </div>
+  );
+};

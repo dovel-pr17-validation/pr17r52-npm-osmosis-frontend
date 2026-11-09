@@ -1,0 +1,334 @@
+import { Address } from "viem";
+
+export type SkipAsset = {
+  denom: string;
+  chain_id: string;
+
+  origin_denom: string;
+  origin_chain_id: string;
+  trace: string;
+  is_cw20: boolean;
+  is_evm: boolean;
+  is_svm: boolean;
+
+  symbol?: string;
+  name?: string;
+  logo_uri?: string;
+  decimals?: number;
+  token_contract?: string;
+  description?: string;
+  coingecko_id?: string;
+  recommended_symbol?: string;
+};
+
+export type SkipChain = {
+  chain_name: string;
+  chain_id: string;
+  pfm_enabled: boolean;
+  cosmos_sdk_version: string;
+  supports_memo: boolean;
+  logo_uri?: string;
+  bech32_prefix: string;
+  chain_type: string;
+};
+
+export type SkipRouteRequestBase = {
+  source_asset_denom: string;
+  source_asset_chain_id: string;
+  dest_asset_denom: string;
+  dest_asset_chain_id: string;
+
+  cumulative_affiliate_fee_bps?: string;
+  client_id?: string;
+  /**
+   * Allow routes requiring more than one user-signed transaction. Off by
+   * default: without it Skip errors with "no single-tx routes found" when
+   * only multi-tx routes exist (e.g. CCTP deposits ending in an Osmosis
+   * swap, where Noble's forwarding cannot carry the swap memo).
+   */
+  allow_multi_tx?: boolean;
+  /** Opt-in route types. `/route` only; `/msgs` rejects the field. */
+  experimental_features?: "eureka"[];
+  smart_swap_options?: {
+    evm_swaps?: boolean;
+    split_routes?: boolean;
+  };
+};
+
+export type SkipRouteRequestGivenIn = SkipRouteRequestBase & {
+  amount_in: string;
+  amount_out?: never;
+};
+
+export type SkipRouteRequestGivenOut = SkipRouteRequestBase & {
+  amount_in?: never;
+  amount_out: string;
+};
+
+export type SkipRouteRequest =
+  SkipRouteRequestGivenIn | SkipRouteRequestGivenOut;
+
+export type SkipRouteResponse = {
+  source_asset_denom: string;
+  source_asset_chain_id: string;
+  dest_asset_denom: string;
+  dest_asset_chain_id: string;
+  amount_in: string;
+  amount_out: string;
+
+  operations: SkipOperation[];
+  chain_ids: string[];
+  /**
+   * Chains an address must be provided for in the `/msgs` address_list, in
+   * order. NOT the same as `chain_ids`: it can repeat a chain (e.g.
+   * ["42161","noble-1","osmosis-1","osmosis-1"] for a multi-tx route), so
+   * address lists must be built from this, not `chain_ids`.
+   */
+  required_chain_addresses?: string[];
+
+  does_swap: boolean;
+  estimated_amount_out?: string;
+  swap_venue?: SkipSwapVenue;
+
+  txs_required: number;
+
+  usd_amount_in?: string;
+  usd_amount_out?: string;
+  swap_price_impact_percent?: string;
+
+  estimated_fees?: SkipEstimatedFee[];
+
+  estimated_route_duration_seconds: number;
+};
+
+export type SkipEstimatedFee = {
+  fee_type: string;
+  bridge_id: string;
+  amount: string;
+  usd_amount: string;
+  origin_asset: SkipAsset | null;
+  chain_id: string;
+  tx_index: number;
+  /** `FEE_BEHAVIOR_ADDITIONAL`: charged on top of `amount_in` (EVM-source transfers).
+   *  `FEE_BEHAVIOR_DEDUCTED`: taken out of the transferred amount (Cosmos-source transfers).
+   *  `FEE_BEHAVIOR_UNSPECIFIED`: proto3 zero-value; treated as unknown. */
+  fee_behavior?:
+    | "FEE_BEHAVIOR_ADDITIONAL"
+    | "FEE_BEHAVIOR_DEDUCTED"
+    | "FEE_BEHAVIOR_UNSPECIFIED";
+};
+
+export type SkipOperation =
+  | { transfer: SkipTransfer }
+  | { swap: SkipSwap }
+  | { evm_swap: SkipEvmSwap }
+  | { axelar_transfer: SkipAxelarTransfer }
+  | { cctp_transfer: SkipCctpTransfer }
+  | { eureka_transfer: SkipEurekaTransfer };
+
+/**
+ * IBC Eureka transfer between the Cosmos Hub and Ethereum. Its relay fee is
+ * reported as a SMART_RELAY estimated fee, like CCTP.
+ */
+export type SkipEurekaTransfer = {
+  from_chain_id: string;
+  to_chain_id: string;
+  denom_in: string;
+  denom_out: string;
+  bridge_id: string;
+  smart_relay?: boolean;
+};
+
+/** A swap performed on the destination EVM chain by the Axelar GMP executor. */
+export type SkipEvmSwap = {
+  input_token: string;
+  /**
+   * What the executor's calldata spends. Skip fixes this at the untoleranced
+   * quote, so it does not move with `slippage_tolerance_percent`.
+   */
+  amount_in: string;
+  amount_out: string;
+  swap_calldata: string;
+  from_chain_id: string;
+  denom_in: string;
+  denom_out: string;
+};
+
+export type SkipTransfer = {
+  port: string;
+  channel: string;
+  chain_id: string;
+  pfm_enabled: boolean;
+  dest_denom: string;
+  supports_memo: boolean;
+};
+
+export type SkipSwap = (
+  { swap_in: SkipSwapExactCoinIn } | { swap_out: SkipSwapExactCoinOut }
+) & {
+  estimated_affiliate_fee?: string;
+};
+
+export type SkipSwapExactCoinIn = {
+  swap_venue: SkipSwapVenue;
+  swap_operations: SkipSwapOperation[];
+  swap_amount_in?: string;
+  price_impact_percent?: string;
+};
+
+export type SkipSwapVenue = {
+  name: string;
+  chain_id: string;
+};
+
+export type SkipSwapOperation = {
+  pool: string;
+  denom_in: string;
+  denom_out: string;
+};
+
+export type SkipAxelarTransfer = {
+  from_chain: string;
+  from_chain_id: string;
+  to_chain: string;
+  to_chain_id: string;
+  asset: string;
+  should_unwrap: boolean;
+  fee_amount: string;
+  fee_asset: SkipAsset;
+  is_testnet: boolean;
+};
+
+/** A Circle CCTP burn-and-mint leg, used on the native USDC routes. */
+export type SkipCctpTransfer = {
+  from_chain_id: string;
+  to_chain_id: string;
+  burn_token: string;
+  denom_in: string;
+  denom_out: string;
+  bridge_id: string;
+  smart_relay: boolean;
+  /**
+   * Present when `smart_relay` is set, and Skip expects it back on the `/msgs`
+   * request: dropping it quotes a different relay fee to the one shown.
+   * Operations are passed through as received, so this is here to stop a typed
+   * reconstruction losing it.
+   */
+  smart_relay_fee_quote?: {
+    fee_amount: string;
+    fee_denom: string;
+    fee_payment_address: string;
+    relayer_address: string;
+    expiration: string;
+  };
+};
+
+export type SkipSwapExactCoinOut = {
+  swap_venue: SkipSwapVenue;
+  swap_operations: SkipSwapOperation[];
+  swap_amount_out: string;
+  price_impact_percent?: string;
+};
+
+export type SkipMsgsRequest = {
+  source_asset_denom: string;
+  source_asset_chain_id: string;
+  dest_asset_denom: string;
+  dest_asset_chain_id: string;
+  amount_in: string;
+  amount_out: string;
+  address_list: string[];
+  operations: SkipOperation[];
+
+  /**
+   * Required, despite reading as a tuning knob: Skip rejects a `/msgs` build
+   * that omits it — or sends it empty — with `invalid
+   * slippage_tolerance_percent`. Kept non-optional so a new call site cannot
+   * forget it and fail only at runtime.
+   */
+  slippage_tolerance_percent: string;
+
+  estimated_amount_out?: string;
+  affiliates?: SkipAffiliate[];
+
+  client_id?: string;
+};
+
+export type SkipAffiliate = {
+  basis_points_fee: string;
+  address: string;
+};
+
+export type SkipMsgsResponse = {
+  msgs: SkipMsg[];
+};
+
+/**
+ * The subset of a quoted multi-tx route needed to rebuild its later steps'
+ * msgs without re-routing. Serialized into quotes as `multiTxRouteData` and
+ * passed back verbatim to `getTransactionStep`.
+ */
+export type SkipMultiTxRouteData = {
+  source_asset_denom: string;
+  source_asset_chain_id: string;
+  dest_asset_denom: string;
+  dest_asset_chain_id: string;
+  amount_in: string;
+  amount_out: string;
+  operations: SkipOperation[];
+  required_chain_addresses: string[];
+  /**
+   * The tolerance the quote was built with, so later steps sign the same one.
+   * Absent on routes persisted before it was stored.
+   */
+  slippage_tolerance_percent?: string;
+};
+
+export type SkipMsg =
+  | { multi_chain_msg: SkipMultiChainMsg }
+  | { evm_tx: SkipEvmTx }
+  | { svm_tx: SkipSvmTx };
+
+/** A complete Solana transaction built by Skip, for the user's wallet to
+ *  sign and send. */
+export interface SkipSvmTx {
+  chain_id: string;
+  /** Base64-encoded transaction. */
+  tx: string;
+  signer_address: string;
+}
+
+export type SkipMultiChainMsg = {
+  chain_id: string;
+  path: string[];
+  msg: string;
+  msg_type_url: string;
+};
+
+export type SkipEvmTx = {
+  chain_id: string;
+  to: Address;
+  value: string;
+  data: string;
+  required_erc20_approvals: SkipERC20Approval[];
+};
+
+export type SkipERC20Approval = {
+  token_contract: Address;
+  spender: Address;
+  amount: string;
+};
+
+export type SkipStatusState =
+  | "STATE_UNKNOWN"
+  | "STATE_SUBMITTED"
+  | "STATE_PENDING"
+  | "STATE_RECEIVED"
+  | "STATE_COMPLETED"
+  | "STATE_ABANDONED"
+  | "STATE_COMPLETED_SUCCESS"
+  | "STATE_COMPLETED_ERROR";
+
+export type SkipTxStatusResponse = {
+  state: SkipStatusState;
+};

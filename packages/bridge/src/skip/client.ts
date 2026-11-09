@@ -1,0 +1,147 @@
+import { apiClient } from "@osmosis-labs/utils";
+
+import { BridgeEnvironment } from "../interface";
+import {
+  SkipAsset,
+  SkipChain,
+  SkipMsgsRequest,
+  SkipMsgsResponse,
+  SkipRouteRequest,
+  SkipRouteResponse,
+  SkipTxStatusResponse,
+} from "./types";
+
+export class SkipApiClient {
+  constructor(
+    readonly env: BridgeEnvironment,
+    protected readonly apiKey = process.env.SKIP_API_KEY,
+    readonly baseUrl = "https://api.skip.money"
+  ) {}
+
+  async assets({ chainID }: { chainID?: string } = {}) {
+    const url = new URL("/v2/fungible/assets", this.baseUrl);
+
+    url.searchParams.append("include_evm_assets", "true");
+    url.searchParams.append("include_cw20_assets", "true");
+    // SPL assets (e.g. Solana USDC), for in-app withdrawals to Solana
+    url.searchParams.append("include_svm_assets", "true");
+
+    if (chainID) {
+      url.searchParams.set("chain_id", chainID);
+    }
+
+    if (this.env === "testnet") {
+      url.searchParams.append("only_testnets", "true");
+    }
+
+    const data = await this.authorizedApiClient<{
+      chain_to_assets_map: Record<string, { assets: SkipAsset[] }>;
+    }>(url.toString());
+
+    return data.chain_to_assets_map;
+  }
+
+  async chains() {
+    const url = new URL("/v2/info/chains", this.baseUrl);
+
+    url.searchParams.append("include_evm", "true");
+    // Solana (chain_type "svm"), for in-app withdrawals to Solana
+    url.searchParams.append("include_svm", "true");
+
+    if (this.env === "testnet") {
+      url.searchParams.append("only_testnets", "true");
+    }
+
+    const data = await this.authorizedApiClient<{
+      chains: SkipChain[];
+    }>(url.toString());
+
+    return data.chains;
+  }
+
+  async route(options: SkipRouteRequest) {
+    return this.authorizedApiClient<SkipRouteResponse>(
+      `${this.baseUrl}/v2/fungible/route`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ...options,
+          cumulative_affiliate_fee_bps:
+            options.cumulative_affiliate_fee_bps ?? "0",
+          smart_swap_options: {
+            evm_swaps: true,
+            ...options.smart_swap_options,
+          },
+          // Eureka (Cosmos Hub to Ethereum) routes are only returned when
+          // requested. `/msgs` rejects this field and rebuilds the Eureka
+          // route from its operations without it.
+          experimental_features: ["eureka"],
+        }),
+      }
+    );
+  }
+
+  async messages(options: SkipMsgsRequest) {
+    return this.authorizedApiClient<SkipMsgsResponse>(
+      `${this.baseUrl}/v2/fungible/msgs`,
+      {
+        method: "POST",
+        body: JSON.stringify(options),
+      }
+    );
+  }
+
+  async trackTransaction({
+    chainID,
+    txHash,
+  }: {
+    chainID: string;
+    txHash: string;
+  }) {
+    return this.authorizedApiClient<{ tx_id: string }>(
+      `${this.baseUrl}/v2/tx/track`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          chain_id: chainID,
+          tx_hash: txHash,
+        }),
+      }
+    );
+  }
+
+  async transactionStatus({
+    chainID,
+    txHash,
+  }: {
+    chainID: string;
+    txHash: string;
+  }) {
+    const url = new URL("/v2/tx/status", this.baseUrl);
+
+    url.searchParams.append("chain_id", chainID);
+    url.searchParams.append("tx_hash", txHash);
+
+    return this.authorizedApiClient<SkipTxStatusResponse>(url.toString());
+  }
+
+  protected authorizedApiClient<Response>(
+    ...args: Parameters<typeof apiClient>
+  ) {
+    if (process.env.NODE_ENV === "test") {
+      return apiClient<Response>(args[0], args[1]);
+    }
+
+    const key = this.apiKey;
+    if (!key) throw new Error("SKIP_API_KEY is not set");
+
+    return apiClient<Response>(args[0], {
+      ...args[1],
+      headers: {
+        ...args[1]?.headers,
+        // This is the format confirmed by Skip team
+        Authorization: key,
+      },
+    });
+  }
+}

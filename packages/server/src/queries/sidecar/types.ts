@@ -1,0 +1,82 @@
+export type SidecarQuoteResponse = {
+  amount_in: {
+    denom: string;
+    amount: string;
+  };
+  amount_out: string;
+  effective_fee: string;
+  price_impact: string;
+  /** Set by SQS when it could not compute the impact; `price_impact` is then a placeholder "0". Omitted when false. */
+  price_impact_unknown?: boolean;
+  in_base_out_quote_spot_price: string;
+  liquidity_cap: string;
+  liquidity_cap_overflow: boolean;
+  tokens: {
+    denom: string;
+    liquidity_cap: string;
+  }[];
+  route: {
+    in_amount: string;
+    out_amount: string;
+    "has-cw-pool": boolean;
+    pools: {
+      id: number;
+      type: number;
+      balances: {
+        denom: string;
+        amount: string;
+      };
+      spread_factor: string;
+      taker_fee: string;
+      token_out_denom: string;
+
+      /** Code ID, if a Cosmwasm pool. */
+      code_id?: number;
+    }[];
+  }[];
+};
+
+export type SidecarInGivenOutQuoteResponse = {
+  amount_out: {
+    denom: string;
+    amount: string;
+  };
+  amount_in: string;
+  effective_fee: string;
+  price_impact: string;
+  /** Set by SQS when it could not compute the impact; `price_impact` is then a placeholder "0". Omitted when false. */
+  price_impact_unknown?: boolean;
+  in_base_out_quote_spot_price: string;
+  liquidity_cap: string;
+  liquidity_cap_overflow: boolean;
+  tokens: {
+    denom: string;
+    liquidity_cap: string;
+  }[];
+  route: {
+    in_amount: string;
+    out_amount: string;
+    "has-cw-pool": boolean;
+    pools: {
+      id: number;
+      type: number;
+      balances: {
+        denom: string;
+        amount: string;
+      };
+      spread_factor: string;
+      taker_fee: string;
+      token_in_denom: string;
+
+      /** Code ID, if a Cosmwasm pool. */
+      code_id?: number;
+    }[];
+  }[];
+};
+
+export const enum SidecarPoolType {
+  Weighted = 0,
+  Stable = 1,
+  Concentrated = 2,
+  CosmWasm = 3,
+}

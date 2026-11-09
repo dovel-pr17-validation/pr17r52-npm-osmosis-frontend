@@ -1,0 +1,591 @@
+import type { PoolRawResponse } from "@osmosis-labs/types";
+import { AssetList, Chain } from "@osmosis-labs/types";
+import { CoinPretty, Dec, PricePretty, RatePretty } from "@osmosis-labs/unit";
+import { timeout } from "@osmosis-labs/utils";
+import cachified, { CacheEntry } from "cachified";
+import { LRUCache } from "lru-cache";
+
+import { EXCLUDED_EXTERNAL_BOOSTS_POOL_IDS, IS_TESTNET } from "../../../../env";
+import {
+  PaginationType,
+  PoolProviderResponse,
+  SearchType,
+  SortType,
+} from "../../../../queries/complex/pools";
+import { queryPools } from "../../../../queries/sidecar";
+import { DEFAULT_LRU_OPTIONS } from "../../../../utils/cache";
+import { getAsset, isHoldingValueUnknown } from "../../assets";
+import { DEFAULT_VS_CURRENCY } from "../../assets/config";
+import { getCosmwasmPoolTypeFromCodeId } from "../env";
+import { Pool, PoolIncentiveType, PoolType } from "../index";
+
+type SidecarPool = Awaited<ReturnType<typeof queryPools>>["data"][number];
+
+const poolsCache = new LRUCache<string, CacheEntry>(DEFAULT_LRU_OPTIONS);
+
+/**
+ * Pools that are excluded from showing external boost incentives APRs.
+ */
+const ExcludedExternalBoostPools: string[] =
+  (EXCLUDED_EXTERNAL_BOOSTS_POOL_IDS ?? []) as string[];
+
+/** Lightly cached pools from sidecar service. */
+export function getPoolsFromSidecar({
+  assetLists,
+  poolIds,
+  notPoolIds,
+  types,
+  incentives,
+  denoms,
+  minLiquidityUsd,
+  withMarketIncentives = true,
+  pagination,
+  sort,
+  search,
+}: {
+  assetLists: AssetList[];
+  chainList: Chain[];
+  poolIds?: string[];
+  notPoolIds?: string[];
+  types?: PoolType[];
+  incentives?: string[];
+  denoms?: string[];
+  minLiquidityUsd?: number;
+  withMarketIncentives?: boolean;
+  search?: SearchType;
+  pagination?: PaginationType;
+  sort?: SortType;
+}): Promise<PoolProviderResponse> {
+  if (poolIds && !poolIds.length) {
+    return Promise.resolve({ data: [], total: 0, nextCursor: undefined });
+  }
+
+  return cachified({
+    cache: poolsCache,
+    key:
+      (poolIds ? `sidecar-pools-${poolIds.join(",")}` : "sidecar-pools") +
+      (notPoolIds?.join(",") ?? "") +
+      (types?.join(",") ?? "") +
+      (incentives?.join(",") ?? "") +
+      (denoms?.join(",") ?? "") +
+      (minLiquidityUsd ?? "") +
+      withMarketIncentives.toString() +
+      (pagination ? JSON.stringify(pagination) : "") +
+      (sort ? JSON.stringify(sort) : "") +
+      (search ? JSON.stringify(search) : ""),
+    ttl: 5_000, // 5 seconds
+    getFreshValue: async () => {
+      const sidecarPools = await timeout(
+        () =>
+          queryPools({
+            poolIds,
+            notPoolIds,
+            types,
+            incentives,
+            denoms,
+            minLiquidityCap: minLiquidityUsd?.toString(),
+            withMarketIncentives,
+            search,
+            pagination,
+            sort,
+          }),
+        9_000, // 9 seconds
+        "sidecarQueryPools"
+      )();
+
+      const reserveCoins = sidecarPools.data.map((sidecarPool) => {
+        try {
+          return getListedReservesFromSidecarPool(assetLists, sidecarPool);
+        } catch {
+          // Do nothing since low liq pools often contain unlisted tokens
+        }
+      });
+
+      const pools = sidecarPools.data
+        .map((sidecarPool, index) =>
+          makePoolFromSidecarPool({
+            assetLists,
+            sidecarPool,
+            reserveCoins: reserveCoins[index] ?? null,
+          })
+        )
+        .filter(Boolean) as Pool[];
+
+      // Filter pools by requested types
+      // Since sidecar API can't distinguish cosmwasm subtypes, we filter after type identification
+      // Note: generic cosmwasm pools are always included as a fallback
+      const filteredPools = types
+        ? pools.filter(
+            (pool) => types.includes(pool.type) || pool.type === "cosmwasm"
+          )
+        : pools;
+
+      return {
+        data: filteredPools,
+        total: sidecarPools.meta.total_items,
+        nextCursor: sidecarPools.meta.next_cursor,
+      };
+    },
+  });
+}
+
+/** Converts a single SQS pool model response to the standard and more useful Pool type. */
+function makePoolFromSidecarPool({
+  assetLists,
+  sidecarPool,
+  reserveCoins,
+}: {
+  assetLists: AssetList[];
+  sidecarPool: SidecarPool;
+  reserveCoins: CoinPretty[] | null;
+}): Pool | undefined {
+  // contains unlisted or invalid assets
+  // We avoid this check in testnet because we would like to show the pools even if we don't have accurate listing
+  // to ease integrations.
+  if (!reserveCoins && !IS_TESTNET) return;
+
+  const pool_id = getPoolIdFromChainPool(sidecarPool.chain_model);
+  const data = getMarketIncentivesData(pool_id, sidecarPool);
+
+  return {
+    id: getPoolIdFromChainPool(sidecarPool.chain_model),
+    type: getPoolTypeFromChainPool(sidecarPool.chain_model),
+    raw: makePoolRawResponseFromChainPool(sidecarPool.chain_model),
+    spreadFactor: new RatePretty(sidecarPool.spread_factor),
+
+    // We expect the else case to occur only in testnet
+    reserveCoins: reserveCoins ? reserveCoins : [],
+    totalFiatValueLocked: new PricePretty(
+      DEFAULT_VS_CURRENCY,
+      sidecarPool.liquidity_cap
+    ),
+    tvlUnknown: hasUnpricedReserves(assetLists, sidecarPool),
+    ...data,
+  };
+}
+
+/** True when a reserve that should have a price has none, so `liquidity_cap` only covers
+ *  the priced reserves and the pool's TVL is unknown. SQS flags every zero-cap reserve,
+ *  which also covers zero balances, dust and assets never priced (unverified, preview,
+ *  unstable); `isHoldingValueUnknown` leaves those out. */
+export function hasUnpricedReserves(
+  assetLists: AssetList[],
+  {
+    liquidity_cap_error,
+    balances,
+  }: Pick<SidecarPool, "liquidity_cap_error" | "balances">
+): boolean {
+  if (!liquidity_cap_error) return false;
+
+  // SQS lists each zero-cap reserve as "zero cap for denom (<denom>)". Look up each held
+  // reserve's exact entry rather than parsing the string.
+  return balances.some(
+    ({ denom, amount }) =>
+      liquidity_cap_error.includes(`zero cap for denom (${denom})`) &&
+      isHoldingValueUnknown({ assetLists, coinMinimalDenom: denom, amount })
+  );
+}
+
+// getMarketIncentivesData is a function that returns the incentives and market data for a pool
+// based on the pool_id and the apr_data and fees_data from the sidecar response
+function getMarketIncentivesData(
+  pool_id: string,
+  { apr_data: aprs, fees_data: fees }: SidecarPool
+) {
+  let totalUpper = maybeMakeRatePretty(aprs?.total_apr.upper ?? 0);
+  let totalLower = maybeMakeRatePretty(aprs?.total_apr.lower ?? 0);
+  const swapFeeUpper = maybeMakeRatePretty(aprs?.swap_fees.upper ?? 0);
+  const swapFeeLower = maybeMakeRatePretty(aprs?.swap_fees.lower ?? 0);
+  const superfluidUpper = maybeMakeRatePretty(aprs?.superfluid.upper ?? 0);
+  const superfluidLower = maybeMakeRatePretty(aprs?.superfluid.lower ?? 0);
+  const osmosisUpper = maybeMakeRatePretty(aprs?.osmosis.upper ?? 0);
+  const osmosisLower = maybeMakeRatePretty(aprs?.osmosis.lower ?? 0);
+  let boostUpper = maybeMakeRatePretty(aprs?.boost.upper ?? 0);
+  let boostLower = maybeMakeRatePretty(aprs?.boost.lower ?? 0);
+
+  // Temporarily exclude pools in this array from showing boost incentives given an issue on chain
+  if (
+    ExcludedExternalBoostPools.includes(pool_id) &&
+    totalUpper &&
+    totalLower &&
+    boostUpper &&
+    boostLower
+  ) {
+    totalUpper = new RatePretty(totalUpper.toDec().sub(totalUpper.toDec()));
+    totalLower = new RatePretty(totalLower.toDec().sub(totalLower.toDec()));
+    boostUpper = undefined;
+    boostLower = undefined;
+  }
+
+  // add list of incentives that are defined
+  const incentiveTypes: PoolIncentiveType[] = [];
+  if (superfluidUpper && superfluidLower) incentiveTypes.push("superfluid");
+  if (osmosisUpper && osmosisLower) incentiveTypes.push("osmosis");
+  // OSMO pool incentives ended when minting stopped, so boost must not depend on them.
+  if (boostUpper && boostLower) incentiveTypes.push("boost");
+  if (
+    !superfluidUpper &&
+    !superfluidLower &&
+    !osmosisUpper &&
+    !osmosisLower &&
+    !boostUpper &&
+    !boostLower
+  )
+    incentiveTypes.push("none");
+  const hasBreakdownData =
+    totalUpper ||
+    totalLower ||
+    swapFeeUpper ||
+    swapFeeLower ||
+    superfluidUpper ||
+    superfluidLower ||
+    osmosisUpper ||
+    osmosisLower ||
+    boostUpper ||
+    boostLower;
+
+  return {
+    incentives: {
+      aprBreakdown: hasBreakdownData
+        ? {
+            total: {
+              upper: totalUpper,
+              lower: totalLower,
+            },
+            swapFee: {
+              upper: swapFeeUpper,
+              lower: swapFeeLower,
+            },
+            superfluid: {
+              upper: superfluidUpper,
+              lower: superfluidLower,
+            },
+            osmosis: {
+              upper: osmosisUpper,
+              lower: osmosisLower,
+            },
+            boost: {
+              upper: boostUpper,
+              lower: boostLower,
+            },
+          }
+        : undefined,
+      incentiveTypes,
+    },
+    market: {
+      volume24hUsd: maybeMakeMarketPricePretty(fees, fees?.volume_24h),
+      volume7dUsd: maybeMakeMarketPricePretty(fees, fees?.volume_7d),
+      feesSpent24hUsd: maybeMakeMarketPricePretty(fees, fees?.fees_spent_24h),
+      feesSpent7dUsd: maybeMakeMarketPricePretty(fees, fees?.fees_spent_7d),
+    },
+  };
+}
+
+/** Volume and fee values are unknown, not zero, when SQS has no fee data for the pool
+ *  (e.g. its fees source is down), so return undefined rather than $0. */
+function maybeMakeMarketPricePretty(
+  fees: SidecarPool["fees_data"],
+  value: number | undefined
+): PricePretty | undefined {
+  if (!fees || fees.is_error || value == null) return;
+
+  return new PricePretty(DEFAULT_VS_CURRENCY, value);
+}
+
+/** Checks explicitly for 0 or null before creating rate display object. */
+function maybeMakeRatePretty(value: number): RatePretty | undefined {
+  if (value === 0 || value === null) {
+    return undefined;
+  }
+
+  return new RatePretty(new Dec(value).quo(new Dec(100)));
+}
+
+function getPoolIdFromChainPool(
+  chain_model: SidecarPool["chain_model"]
+): string {
+  return (
+    "pool_id" in chain_model ? chain_model.pool_id : chain_model.id
+  ).toString();
+}
+
+// since type URL was removed from chain_model in sidecar response
+// we use the different shapes of the pool model to derive the pool type
+export function getPoolTypeFromChainPool(
+  chain_model: SidecarPool["chain_model"]
+): PoolType {
+  if ("pool_assets" in chain_model) return "weighted";
+  if ("scaling_factors" in chain_model) return "stable";
+  if ("current_sqrt_price" in chain_model) return "concentrated";
+  if ("code_id" in chain_model) {
+    return getCosmwasmPoolTypeFromCodeId(chain_model.code_id.toString());
+  }
+  throw new Error("Unknown pool type: " + JSON.stringify(chain_model));
+}
+
+/** @throws if an asset is not in asset list or balances are invalid. */
+export function getListedReservesFromSidecarPool(
+  assetLists: AssetList[],
+  sidecarPool: SidecarPool
+): CoinPretty[] {
+  const poolDenoms = getPoolDenomsFromSidecarPool(sidecarPool);
+  const listedBalances = poolDenoms.map((denom) => {
+    const asset = getAsset({ assetLists, anyDenom: denom });
+    const amount = sidecarPool.balances.find(
+      (balance) => balance.denom === denom
+    )?.amount;
+    // no balance
+    if (!amount) throw new Error("No balance for asset: " + denom);
+    return new CoinPretty(asset, amount);
+  });
+
+  return listedBalances as CoinPretty[];
+}
+
+function getPoolDenomsFromSidecarPool({ chain_model, balances }: SidecarPool) {
+  if ("pool_assets" in chain_model) {
+    return chain_model.pool_assets.map((asset) => asset.token.denom);
+  }
+
+  if ("pool_liquidity" in chain_model) {
+    return chain_model.pool_liquidity.map(({ denom }) => denom);
+  }
+
+  if ("token0" in chain_model) {
+    return [chain_model.token0, chain_model.token1];
+  }
+
+  // this only works if balances from endpoint only contain balances for assets
+  // traded in that pool
+  return balances.map(({ denom }) => denom);
+}
+
+/** Sidecar made some type changes to the underlying pool, so we map those changes back to the sidecar type.  */
+function makePoolRawResponseFromChainPool(
+  chainPool: SidecarPool["chain_model"]
+): PoolRawResponse {
+  // CL pools
+  if ("current_tick_liquidity" in chainPool) {
+    return {
+      ...chainPool,
+      id: chainPool.id?.toString(),
+      current_tick: chainPool.current_tick?.toString(),
+      tick_spacing: chainPool.tick_spacing?.toString(),
+      exponent_at_price_one: chainPool.exponent_at_price_one?.toString(),
+    } as PoolRawResponse;
+  }
+
+  // Stable pools
+  if ("scaling_factors" in chainPool) {
+    return {
+      ...chainPool,
+      id: chainPool.id?.toString(),
+      scaling_factors: chainPool.scaling_factors?.map((factor) =>
+        factor.toString()
+      ),
+    } as PoolRawResponse;
+  }
+
+  // Weighted pools
+  if ("total_weight" in chainPool) {
+    return {
+      ...chainPool,
+      id: chainPool.id?.toString(),
+      // SQS diverges from the node model by returning total_weight as a string decimal instead of string integer
+      total_weight: chainPool.total_weight.split(".")[0],
+    } as PoolRawResponse;
+  }
+
+  // Cosmwasm pools
+  return {
+    ...chainPool,
+    pool_id: chainPool.pool_id?.toString(),
+    code_id: chainPool.code_id?.toString(),
+  } as PoolRawResponse;
+}
+
+/** Creates a minimal Currency object for an unlisted asset.
+ *  This is used as a fallback when assets are not in the asset list.
+ *  Note: Defaults to 6 decimals (standard for most Cosmos tokens). This may cause
+ *  display precision issues for tokens with different decimal places, but functionality
+ *  remains intact as the chain handles actual token amounts correctly. */
+export function makeUnlistedAssetCurrency(denom: string) {
+  return {
+    coinDenom: denom,
+    coinMinimalDenom: denom,
+    coinDecimals: 6, // Default to 6 decimals, common for most Cosmos tokens
+    coinImageUrl: undefined,
+  };
+}
+
+/** Gets pool denoms from a chain pool (works for both sidecar and direct chain responses) */
+function getPoolDenomsFromChainPool(
+  chainPool: PoolRawResponse
+): string[] | null {
+  if ("pool_assets" in chainPool) {
+    return chainPool.pool_assets.map((asset) => asset.token.denom);
+  }
+
+  if ("pool_liquidity" in chainPool) {
+    return chainPool.pool_liquidity.map(({ denom }) => denom);
+  }
+
+  if ("token0" in chainPool) {
+    return [chainPool.token0, chainPool.token1];
+  }
+
+  // CosmWasm and CL pools without proper denom info cannot be processed
+  return null;
+}
+
+/** Extracts balances from a chain pool response.
+ *  Different pool types store balances differently. */
+function getBalancesFromChainPool(
+  chainPool: PoolRawResponse
+): { denom: string; amount: string }[] | null {
+  // Weighted pools store balances in pool_assets
+  if ("pool_assets" in chainPool) {
+    return chainPool.pool_assets.map((asset) => ({
+      denom: asset.token.denom,
+      amount: asset.token.amount,
+    }));
+  }
+
+  // Stable pools store balances in pool_liquidity
+  if ("pool_liquidity" in chainPool) {
+    return chainPool.pool_liquidity;
+  }
+
+  // Concentrated liquidity pools - query the pool's address balance
+  // TODO: query bank module for pool address balances
+  // For now, return null to indicate unsupported pool type
+  if ("token0" in chainPool) {
+    return null;
+  }
+
+  // Cosmwasm pools - need to query contract state
+  // For now, return null to indicate unsupported pool type
+  return null;
+}
+
+/** Gets reserves from a chain pool, including unlisted assets.
+ *  This doesn't throw when assets are not in the asset list - instead creates minimal currency objects. */
+function getReservesFromChainPool(
+  assetLists: AssetList[],
+  chainPool: PoolRawResponse,
+  balances: { denom: string; amount: string }[]
+): CoinPretty[] {
+  const poolDenoms = getPoolDenomsFromChainPool(chainPool);
+
+  // Should not happen if caller validates, but be defensive
+  if (!poolDenoms) {
+    return [];
+  }
+
+  return poolDenoms.map((denom) => {
+    const amount = balances.find((balance) => balance.denom === denom)?.amount;
+
+    // Try to get the asset from asset lists
+    try {
+      const asset = getAsset({ assetLists, anyDenom: denom });
+      return new CoinPretty(asset, amount ?? "0");
+    } catch {
+      // Asset not in list, create minimal currency
+      const currency = makeUnlistedAssetCurrency(denom);
+      return new CoinPretty(currency, amount ?? "0");
+    }
+  });
+}
+
+/** Converts a chain pool response to Pool type, handling unlisted assets. */
+export function makePoolFromChainPool({
+  chainPool,
+  assetLists,
+}: {
+  chainPool: PoolRawResponse;
+  assetLists: AssetList[];
+}): Pool | null {
+  const pool_id = "pool_id" in chainPool ? chainPool.pool_id : chainPool.id;
+  const balances = getBalancesFromChainPool(chainPool);
+  const poolDenoms = getPoolDenomsFromChainPool(chainPool);
+
+  // Cannot construct valid pool without denoms at all
+  if (poolDenoms === null) {
+    console.warn(
+      `Pool ${pool_id} cannot be constructed from chain data: missing pool denoms (unsupported pool type or malformed data)`
+    );
+    return null;
+  }
+
+  // For concentrated liquidity pools, balances are not directly available from the chain pool
+  // manager response. Synthesize zero-amount entries so we can still construct a minimal Pool
+  // for the chain fallback path. Track whether this synthesis occurred so consumers know the
+  // resulting TVL figure is unknown rather than genuinely zero.
+  const balancesSynthed =
+    balances === null && "current_sqrt_price" in chainPool;
+
+  // Concentrated liquidity pools only set `current_sqrt_price` (and any
+  // `current_tick_liquidity`) when the first position is created. If both are
+  // zero, the pool genuinely has no liquidity and TVL is known to be zero
+  // rather than unknown. Without this, chain-fallback CL pools whose tokens
+  // lack an SQS price route would be misclassified as inactive instead of
+  // uninitialized, sending users into the wrong add-liquidity flow.
+  const isUninitializedConcentratedPool =
+    "current_sqrt_price" in chainPool &&
+    parseFloat(chainPool.current_sqrt_price) === 0 &&
+    parseFloat(chainPool.current_tick_liquidity) === 0;
+
+  const effectiveBalances =
+    balances ??
+    (balancesSynthed
+      ? poolDenoms.map((denom) => ({ denom, amount: "0" }))
+      : null);
+
+  // For non-concentrated pools, we still require actual balances.
+  if (effectiveBalances === null) {
+    console.warn(
+      `Pool ${pool_id} cannot be constructed from chain data: missing balances (unsupported pool type or incomplete data)`
+    );
+    return null;
+  }
+
+  const reserveCoins = getReservesFromChainPool(
+    assetLists,
+    chainPool,
+    effectiveBalances
+  );
+
+  // Get pool type
+  let poolType: PoolType;
+  if ("pool_assets" in chainPool) poolType = "weighted";
+  else if ("scaling_factors" in chainPool) poolType = "stable";
+  else if ("current_sqrt_price" in chainPool) poolType = "concentrated";
+  else if ("code_id" in chainPool) {
+    poolType = getCosmwasmPoolTypeFromCodeId(chainPool.code_id.toString());
+  } else {
+    throw new Error("Unknown pool type: " + JSON.stringify(chainPool));
+  }
+
+  // Get spread factor
+  let spreadFactor = "0";
+  if ("spread_factor" in chainPool) {
+    spreadFactor = chainPool.spread_factor;
+  } else if ("pool_params" in chainPool && chainPool.pool_params?.swap_fee) {
+    spreadFactor = chainPool.pool_params.swap_fee;
+  }
+
+  return {
+    id: pool_id.toString(),
+    type: poolType,
+    raw: chainPool,
+    spreadFactor: new RatePretty(spreadFactor),
+    reserveCoins,
+    totalFiatValueLocked: new PricePretty(DEFAULT_VS_CURRENCY, 0),
+    tvlUnknown: balancesSynthed && !isUninitializedConcentratedPool,
+    // No incentives or market data available from chain, so volume and fees are unknown
+    incentives: {
+      aprBreakdown: undefined,
+      incentiveTypes: ["none"],
+    },
+  };
+}

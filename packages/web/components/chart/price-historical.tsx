@@ -1,0 +1,533 @@
+import { Dec } from "@osmosis-labs/unit";
+import { curveNatural } from "@visx/curve";
+import { LinearGradient } from "@visx/gradient";
+import { ParentSize } from "@visx/responsive";
+import { scaleLinear } from "@visx/scale";
+import {
+  AnimatedAreaSeries,
+  AnimatedAxis,
+  AnimatedGrid,
+  AnimatedLineSeries,
+  Annotation,
+  AnnotationConnector,
+  AnnotationLineSubject,
+  buildChartTheme,
+  Margin,
+  Tooltip,
+  XYChart,
+} from "@visx/xychart";
+import classNames from "classnames";
+import dayjs from "dayjs";
+import React, { FunctionComponent, memo, useCallback, useMemo } from "react";
+
+import { SkeletonLoader } from "~/components/loaders/skeleton-loader";
+import { ChartButton } from "~/components/ui/button";
+import { type PriceRange, useTranslation } from "~/hooks";
+import { theme } from "~/tailwind.config";
+import { compressZeros } from "~/utils/formatter";
+import {
+  FormatOptions,
+  formatPretty,
+  getPriceExtendedFormatOptions,
+} from "~/utils/formatter";
+import { getDecimalCount } from "~/utils/number";
+
+const NUM_Y_TICKS = 5;
+
+/**
+ * Derives the y-axis tick formatter and the left margin needed to fit the
+ * widest tick label, both keyed off the chart's domain.
+ *
+ * `formatYTick` builds on d3's own linear tick formatter (via @visx/scale),
+ * matching the tick count the axis uses, so tight or sub-cent ranges get the
+ * same decimal precision the axis would pick; it then adds thousands separators
+ * the raw d3 formatter omits. The margin is measured from the actual rendered
+ * pixel width of those labels (canvas, using the axis font Inter 12px/500 per
+ * the chart theme's svgLabelSmall), so the gutter fits six-figure prices
+ * (e.g. "118,000") without clipping and stays snug for cheap pairs, with no
+ * hand-tuned per-char guess. Falls back to a generous char estimate when canvas
+ * is unavailable (SSR).
+ */
+function useYAxisTickLayout(domain: [number, number]) {
+  const formatYTick = useMemo(() => {
+    const scale = scaleLinear({ domain, range: [0, 1] });
+    const d3Format = scale.tickFormat(NUM_Y_TICKS);
+    return (value: number) => {
+      // Keep d3's chosen decimal precision (it varies with tick spacing), then
+      // add thousands separators to the integer part, which d3 omits.
+      const formatted = d3Format(value);
+      const negative = formatted.startsWith("-");
+      const [intPart, decPart] = formatted.replace(/^-/, "").split(".");
+      const withCommas = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+      return (
+        (negative ? "-" : "") + withCommas + (decPart ? `.${decPart}` : "")
+      );
+    };
+  }, [domain]);
+
+  const leftMargin = useMemo(() => {
+    const scale = scaleLinear({ domain, range: [0, 1] });
+    const ticks = scale.ticks(NUM_Y_TICKS);
+    // A dead pool with a flat price series yields a zero-width domain and no
+    // ticks; fall back to a representative label so the gutter is still sized.
+    const labels = ticks.length ? ticks.map(formatYTick) : ["0.00"];
+    const tickGap = 8; // tick line + label padding
+
+    let widestPx: number | null = null;
+    if (typeof document !== "undefined") {
+      const ctx = document.createElement("canvas").getContext("2d");
+      if (ctx) {
+        ctx.font = "500 12px Inter, ui-sans-serif, system-ui";
+        widestPx = Math.max(...labels.map((l) => ctx.measureText(l).width));
+      }
+    }
+    // Fallback: 8px per char is a safe upper bound for Inter digits at 12px.
+    if (widestPx == null) {
+      widestPx = Math.max(...labels.map((l) => l.length)) * 8;
+    }
+
+    return Math.max(36, Math.ceil(widestPx + tickGap));
+  }, [domain, formatYTick]);
+
+  return { formatYTick, leftMargin };
+}
+
+export const HistoricalPriceChart: FunctionComponent<{
+  data: { close: number; time: number }[];
+  margin?: Partial<Margin>;
+  annotations: Dec[];
+  domain: [number, number];
+  onPointerHover?: (price: number) => void;
+  onPointerOut?: () => void;
+  showGradient?: boolean;
+  /**
+   * specifies the tick count of the horizontal asset
+   */
+  xNumTicks?: number;
+  /**
+   * Enable tooltip rendering
+   */
+  showTooltip?: boolean;
+  fiatSymbol?: string;
+}> = memo(
+  ({
+    data,
+    annotations,
+    domain,
+    onPointerHover,
+    onPointerOut,
+    showGradient = true,
+    xNumTicks = 4,
+    showTooltip = false,
+    fiatSymbol,
+  }) => {
+    const { formatYTick, leftMargin } = useYAxisTickLayout(domain);
+
+    return (
+      <ParentSize className="flex-shrink-1 flex-1 overflow-hidden">
+        {({ height, width }) => (
+          <XYChart
+            key="line-chart"
+            margin={{ top: 0, right: 0, bottom: 24, left: leftMargin }}
+            height={height}
+            width={width}
+            xScale={{
+              type: "time",
+              paddingInner: 0.5,
+            }}
+            yScale={{
+              type: "linear",
+              domain,
+              zero: false,
+            }}
+            onPointerOut={onPointerOut}
+            onPointerMove={(tooltipData) => {
+              const datum = tooltipData.datum as any;
+              const close = datum.close;
+
+              if (close != null && onPointerHover) {
+                onPointerHover(close);
+              }
+            }}
+            theme={buildChartTheme({
+              backgroundColor: "transparent",
+              colors: showGradient
+                ? [theme.colors.wosmongton["300"]]
+                : ["white"],
+              gridColor: theme.colors.osmoverse["600"],
+              gridColorDark: theme.colors.osmoverse["300"],
+              svgLabelSmall: {
+                fill: theme.colors.osmoverse["300"],
+                fontSize: 12,
+                fontWeight: 500,
+              },
+              svgLabelBig: {
+                fill: theme.colors.osmoverse["300"],
+                fontSize: 12,
+                fontWeight: 500,
+              },
+              tickLength: 1,
+              xAxisLineStyles: {
+                strokeWidth: 0,
+              },
+              xTickLineStyles: {
+                strokeWidth: 0,
+              },
+              yAxisLineStyles: {
+                strokeWidth: 0,
+              },
+            })}
+          >
+            <AnimatedAxis orientation="bottom" numTicks={xNumTicks} />
+            <AnimatedAxis
+              orientation="left"
+              numTicks={NUM_Y_TICKS}
+              strokeWidth={0}
+              tickFormat={formatYTick}
+            />
+            <AnimatedGrid columns={false} numTicks={NUM_Y_TICKS} />
+
+            {showGradient ? (
+              <>
+                <AnimatedAreaSeries
+                  dataKey="close"
+                  data={data}
+                  xAccessor={(d: { time: number; close: number }) => d?.time}
+                  yAccessor={(d: { time: number; close: number }) => d?.close}
+                  fillOpacity={0.4}
+                  curve={curveNatural}
+                  fill="url(#gradient)"
+                />
+                <LinearGradient
+                  id="gradient"
+                  from={theme.colors.chartGradientPrimary}
+                  to={theme.colors.chartGradientSecondary}
+                  rotate={-8}
+                  fromOffset="13.08%"
+                  fromOpacity={1}
+                  toOpacity={0}
+                  toOffset="85.36%"
+                />
+              </>
+            ) : (
+              <AnimatedLineSeries
+                key={data.length}
+                dataKey="close"
+                data={data}
+                curve={curveNatural}
+                xAccessor={(d: { time: number; close: number }) => d?.time}
+                yAccessor={(d: { time: number; close: number }) => d?.close}
+                stroke={theme.colors.wosmongton["200"]}
+              />
+            )}
+            {annotations.map((dec, i) => (
+              <Annotation
+                key={i}
+                dataKey="depth"
+                xAccessor={(d: { close: number; time: number }) => d.time}
+                yAccessor={(d: { close: number; time: number }) => d.close}
+                datum={{ close: Number(dec.toString()), time: 0 }}
+              >
+                <AnnotationConnector />
+                <AnnotationLineSubject
+                  orientation="horizontal"
+                  stroke={theme.colors.wosmongton["200"]}
+                  strokeWidth={2}
+                  strokeDasharray={4}
+                />
+              </Annotation>
+            ))}
+            <Tooltip
+              detectBounds
+              showDatumGlyph
+              horizontalCrosshairStyle={{
+                strokeWidth: 2,
+                strokeDasharray: "5 5",
+                opacity: 0.17,
+                stroke: theme.colors.osmoverse[300],
+              }}
+              verticalCrosshairStyle={{
+                strokeWidth: 2,
+                strokeDasharray: "5 5",
+                opacity: 0.17,
+                stroke: theme.colors.osmoverse[300],
+              }}
+              showVerticalCrosshair={true}
+              renderTooltip={({ tooltipData }: any) => {
+                const close = tooltipData?.nearestDatum?.datum?.close;
+                const time = tooltipData?.nearestDatum?.datum?.time;
+
+                if (showTooltip && time != null && close != null) {
+                  const date = dayjs(time).format("MMM Do, hh:mma");
+                  const minimumDecimals = 2;
+                  const maxDecimals = Math.max(
+                    getDecimalCount(close),
+                    minimumDecimals
+                  );
+
+                  const closeDec = new Dec(close);
+
+                  const formatOpts = getPriceExtendedFormatOptions(closeDec);
+
+                  return (
+                    <div className="relative flex flex-col gap-1 rounded-xl bg-osmoverse-1000 p-3 shadow-md">
+                      <h6 className="text-h6 font-semibold text-white-full">
+                        {fiatSymbol}
+                        {formatPretty(closeDec, {
+                          maxDecimals,
+                          ...formatOpts,
+                        }) || ""}
+                      </h6>
+
+                      <p className="text-caption font-medium text-osmoverse-200">
+                        {date}
+                      </p>
+                    </div>
+                  );
+                }
+
+                return <div></div>;
+              }}
+            />
+          </XYChart>
+        )}
+      </ParentSize>
+    );
+  }
+);
+
+export const PriceChartHeader: FunctionComponent<{
+  historicalRange: PriceRange;
+  setHistoricalRange: (pr: PriceRange) => void;
+  hoverPrice: number;
+  hoverDate?: string | null;
+  decimal: number;
+  formatOpts?: FormatOptions;
+  fiatSymbol?: string;
+  baseDenom?: string;
+  quoteDenom?: string;
+  hideButtons?: boolean;
+  showAllRange?: boolean;
+  isLoading?: boolean;
+  classes?: {
+    buttons?: string;
+    priceHeaderClass?: string;
+    priceSubheaderClass?: string;
+    pricesHeaderContainerClass?: string;
+    pricesHeaderRootContainer?: string;
+  };
+  compactZeros?: boolean;
+}> = ({
+  historicalRange,
+  setHistoricalRange,
+  baseDenom,
+  quoteDenom,
+  hoverDate,
+  hoverPrice,
+  formatOpts,
+  decimal,
+  hideButtons,
+  classes,
+  fiatSymbol,
+  showAllRange = false,
+  isLoading = false,
+  compactZeros = false,
+}) => {
+  const { t } = useTranslation();
+
+  const getFormattedPrice = useCallback(
+    (
+      additionalFormatOpts?: Partial<
+        Intl.NumberFormatOptions & { disabledTrimZeros: boolean }
+      >
+    ) =>
+      formatPretty(new Dec(hoverPrice), {
+        maxDecimals: decimal,
+        notation: "compact",
+        ...formatOpts,
+        ...additionalFormatOpts,
+      }) || "",
+    [decimal, formatOpts, hoverPrice]
+  );
+
+  const { decimalDigits, significantDigits, zeros } = useMemo(
+    () => compressZeros(getFormattedPrice({ disabledTrimZeros: false }), false),
+    [getFormattedPrice]
+  );
+
+  return (
+    <div
+      className={classNames(
+        "flex flex-row lg:flex-col-reverse sm:items-start sm:gap-y-4",
+        classes?.pricesHeaderRootContainer
+      )}
+    >
+      <div
+        className={classNames(
+          "flex flex-1 flex-row",
+          classes?.pricesHeaderContainerClass
+        )}
+      >
+        <div>
+          <SkeletonLoader isLoaded={!isLoading}>
+            <h4
+              className={classNames(
+                "row-span-2 pr-1 font-caption sm:text-h5",
+                classes?.priceHeaderClass
+              )}
+            >
+              {fiatSymbol}
+              {compactZeros ? (
+                <>
+                  {significantDigits}
+                  {(decimalDigits || Boolean(zeros)) && "."}
+                  {Boolean(zeros) && (
+                    <>
+                      0<sub title={`${getFormattedPrice()}USD`}>{zeros}</sub>
+                    </>
+                  )}
+                  {decimalDigits}
+                </>
+              ) : (
+                getFormattedPrice()
+              )}
+            </h4>
+          </SkeletonLoader>
+          {hoverDate !== undefined ? (
+            <p
+              className={classNames(
+                "flex flex-1 flex-col justify-center font-caption text-wosmongton-200",
+                {
+                  "invisible h-6": hoverDate === null,
+                }
+              )}
+            >
+              {hoverDate}
+            </p>
+          ) : (
+            false
+          )}
+        </div>
+        {baseDenom && quoteDenom ? (
+          <div
+            className={classNames(
+              "flex flex-col justify-center font-caption",
+              classes?.priceSubheaderClass
+            )}
+          >
+            <div className="text-caption text-osmoverse-300">
+              {t("addConcentratedLiquidity.currentPrice")}
+            </div>
+            <div className="whitespace-nowrap text-caption text-osmoverse-300">
+              {t("addConcentratedLiquidity.basePerQuote", {
+                base: baseDenom,
+                quote: quoteDenom,
+              })}
+            </div>
+          </div>
+        ) : undefined}
+      </div>
+      {!hideButtons && (
+        <div
+          className={classNames(
+            "flex flex-1 justify-end gap-1 pr-2",
+            classes?.buttons
+          )}
+        >
+          <ChartButton
+            label={t("tokenInfos.chart.xHour", { h: "1" })}
+            onClick={() => setHistoricalRange("1h")}
+            selected={historicalRange === "1h"}
+          />
+          <ChartButton
+            label={t("tokenInfos.chart.xDay", { d: "1" })}
+            onClick={() => setHistoricalRange("1d")}
+            selected={historicalRange === "1d"}
+          />
+          <ChartButton
+            label={t("tokenInfos.chart.xDay", { d: "7" })}
+            onClick={() => setHistoricalRange("7d")}
+            selected={historicalRange === "7d"}
+          />
+          <ChartButton
+            label={t("tokenInfos.chart.xDay", { d: "30" })}
+            onClick={() => setHistoricalRange("1mo")}
+            selected={historicalRange === "1mo"}
+          />
+          <ChartButton
+            label={t("tokenInfos.chart.xYear", { y: "1" })}
+            onClick={() => setHistoricalRange("1y")}
+            selected={historicalRange === "1y"}
+          />
+          {showAllRange ? (
+            <ChartButton
+              label={t("tokenInfos.chart.all", { y: "1" })}
+              onClick={() => setHistoricalRange("all")}
+              selected={historicalRange === "all"}
+            />
+          ) : (
+            false
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const ChartUnavailable: FunctionComponent = () => {
+  const { t } = useTranslation();
+
+  return (
+    <div className="flex h-full flex-1 items-center justify-center">
+      <span className="spacing text-center text-[32px] font-h4 text-osmoverse-500">
+        {t("errors.chartUnavailable")}
+      </span>
+    </div>
+  );
+};
+
+/** Displays a decimal with subscript 0s, with unsyled elements, without a root parent element. */
+export const SubscriptDecimal: FunctionComponent<{
+  decimal: Dec;
+  maxDecimals?: number;
+  /** Overrides default from result of `getPriceExtendedFormatOptions` */
+  formatOptions?: FormatOptions;
+}> = ({ decimal: price, maxDecimals = 3, formatOptions }) => {
+  const formatOpts = useMemo(
+    () => formatOptions ?? getPriceExtendedFormatOptions(price),
+    [formatOptions, price]
+  );
+
+  const getFormattedPrice = useCallback(
+    (
+      additionalFormatOpts?: Partial<
+        Intl.NumberFormatOptions & { disabledTrimZeros: boolean }
+      >
+    ) =>
+      formatPretty(price, {
+        maxDecimals,
+        notation: "compact",
+        ...formatOpts,
+        ...additionalFormatOpts,
+      }) || "",
+    [maxDecimals, formatOpts, price]
+  );
+
+  const { decimalDigits, significantDigits, zeros } = useMemo(
+    () => compressZeros(getFormattedPrice({ disabledTrimZeros: false }), false),
+    [getFormattedPrice]
+  );
+
+  return (
+    <>
+      {significantDigits}
+      {(decimalDigits || Boolean(zeros)) && "."}
+      {Boolean(zeros) && (
+        <>
+          0<sub title={getFormattedPrice()}>{zeros}</sub>
+        </>
+      )}
+      {decimalDigits}
+    </>
+  );
+};

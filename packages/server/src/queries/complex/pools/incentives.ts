@@ -1,0 +1,376 @@
+import type { AssetList, Chain } from "@osmosis-labs/types";
+import { CoinPretty, Dec, RatePretty } from "@osmosis-labs/unit";
+import cachified, { type CacheEntry } from "cachified";
+import dayjs from "dayjs";
+import duration from "dayjs/plugin/duration";
+import relativeTime from "dayjs/plugin/relativeTime";
+import { LRUCache } from "lru-cache";
+import { z } from "zod";
+
+import { EXCLUDED_EXTERNAL_BOOSTS_POOL_IDS } from "../../../env";
+import { queryPriceRangeApr } from "../../../queries/data-services";
+import {
+  DATA_SERVICES_APR_MAX_AGE,
+  DEFAULT_LRU_OPTIONS,
+} from "../../../utils/cache";
+import {
+  type PoolDataRange,
+  queryPoolAprsRange,
+} from "../../data-services/pool-aprs";
+import {
+  type Gauge,
+  queryEpochProvisions,
+  queryGauges,
+  queryPoolGaugeIds,
+} from "../../osmosis";
+import { queryIncentivizedPools } from "../../osmosis/incentives/incentivized-pools";
+import { getAsset } from "../assets";
+import { getEpochs } from "../osmosis";
+import type { Epoch } from "../osmosis/epochs";
+
+/**
+ * Pools that are excluded from showing external boost incentives APRs.
+ */
+const ExcludedExternalBoostPools: string[] =
+  (EXCLUDED_EXTERNAL_BOOSTS_POOL_IDS ?? []) as string[];
+
+dayjs.extend(duration);
+dayjs.extend(relativeTime);
+
+const allPoolIncentiveTypes = [
+  "superfluid",
+  "osmosis",
+  "boost",
+  "none",
+] as const;
+export type PoolIncentiveType = (typeof allPoolIncentiveTypes)[number];
+
+export type PoolIncentives = Partial<{
+  aprBreakdown: Partial<{
+    total: PoolDataRange<RatePretty | undefined>;
+    swapFee: PoolDataRange<RatePretty | undefined>;
+    superfluid: PoolDataRange<RatePretty | undefined>;
+    osmosis: PoolDataRange<RatePretty | undefined>;
+    boost: PoolDataRange<RatePretty | undefined>;
+  }>;
+  incentiveTypes: PoolIncentiveType[];
+}>;
+
+export const IncentivePoolFilterSchema = z.object({
+  /** Only include pools of given incentive types. */
+  incentiveTypes: z.array(z.enum(allPoolIncentiveTypes)).optional(),
+});
+
+export function getPoolIncentives(poolId: string) {
+  return getCachedPoolIncentivesMap().then((map) => map.get(poolId));
+}
+
+const incentivePoolsCache = new LRUCache<string, CacheEntry>({ max: 1 });
+/** Get a cached Map with pool IDs mapped to incentives for that pool. */
+export function getCachedPoolIncentivesMap(): Promise<
+  Map<string, PoolIncentives>
+> {
+  return cachified({
+    cache: incentivePoolsCache,
+    key: "pools-incentives-map",
+    ttl: 1000 * 30, // 30 seconds
+    staleWhileRevalidate: DATA_SERVICES_APR_MAX_AGE - 1000 * 30,
+    getFreshValue: async () => {
+      const aprs = await queryPoolAprsRange();
+
+      return aprs.reduce((map, apr) => {
+        let totalUpper = maybeMakeRatePretty(apr.total_apr.upper);
+        let totalLower = maybeMakeRatePretty(apr.total_apr.lower);
+        const swapFeeUpper = maybeMakeRatePretty(apr.swap_fees.upper);
+        const swapFeeLower = maybeMakeRatePretty(apr.swap_fees.lower);
+        const superfluidUpper = maybeMakeRatePretty(apr.superfluid.upper);
+        const superfluidLower = maybeMakeRatePretty(apr.superfluid.lower);
+        const osmosisUpper = maybeMakeRatePretty(apr.osmosis.upper);
+        const osmosisLower = maybeMakeRatePretty(apr.osmosis.lower);
+        let boostUpper = maybeMakeRatePretty(apr.boost.upper);
+        let boostLower = maybeMakeRatePretty(apr.boost.lower);
+
+        // Temporarily exclude pools in this array from showing boost incentives given an issue on chain
+        if (
+          ExcludedExternalBoostPools.includes(apr.pool_id) &&
+          totalUpper &&
+          totalLower &&
+          boostUpper &&
+          boostLower
+        ) {
+          totalUpper = new RatePretty(
+            totalUpper.toDec().sub(totalUpper.toDec())
+          );
+          totalLower = new RatePretty(
+            totalLower.toDec().sub(totalLower.toDec())
+          );
+          boostUpper = undefined;
+          boostLower = undefined;
+        }
+
+        // add list of incentives that are defined
+        const incentiveTypes: PoolIncentiveType[] = [];
+        if (superfluidUpper && superfluidLower)
+          incentiveTypes.push("superfluid");
+        if (osmosisUpper && osmosisLower) incentiveTypes.push("osmosis");
+        // OSMO pool incentives ended when minting stopped, so boost must not depend on them.
+        if (boostUpper && boostLower) incentiveTypes.push("boost");
+        if (
+          !superfluidUpper &&
+          !superfluidLower &&
+          !osmosisUpper &&
+          !osmosisLower &&
+          !boostUpper &&
+          !boostLower
+        )
+          incentiveTypes.push("none");
+        const hasBreakdownData =
+          totalUpper ||
+          totalLower ||
+          swapFeeUpper ||
+          swapFeeLower ||
+          superfluidUpper ||
+          superfluidLower ||
+          osmosisUpper ||
+          osmosisLower ||
+          boostUpper ||
+          boostLower;
+
+        map.set(apr.pool_id, {
+          aprBreakdown: hasBreakdownData
+            ? {
+                total: {
+                  upper: totalUpper,
+                  lower: totalLower,
+                },
+                swapFee: {
+                  upper: swapFeeUpper,
+                  lower: swapFeeLower,
+                },
+                superfluid: {
+                  upper: superfluidUpper,
+                  lower: superfluidLower,
+                },
+                osmosis: {
+                  upper: osmosisUpper,
+                  lower: osmosisLower,
+                },
+                boost: {
+                  upper: boostUpper,
+                  lower: boostLower,
+                },
+              }
+            : undefined,
+          incentiveTypes,
+        });
+
+        return map;
+      }, new Map<string, PoolIncentives>());
+    },
+  });
+}
+
+const aprCache = new LRUCache<string, CacheEntry>(DEFAULT_LRU_OPTIONS);
+/** Ranges whose APR response was invalid (NaN). cachified doesn't keep failures, so
+ *  without this a range that never had a good value would re-query the data service on
+ *  every call. Only the failure is kept, never a value. */
+const invalidAprRanges = new LRUCache<string, Error>({
+  max: 1_000,
+  ttl: 30 * 1000, // 30 seconds
+});
+
+export function getConcentratedRangePoolApr({
+  poolId,
+  upperTick,
+  lowerTick,
+}: {
+  poolId: string;
+  lowerTick: string;
+  upperTick: string;
+}): Promise<RatePretty | undefined> {
+  const key = `concentrated-pool-apr-${poolId}-${lowerTick}-${upperTick}`;
+  return cachified({
+    cache: aprCache,
+    key,
+    ttl: 30 * 1000, // 30 seconds
+    staleWhileRevalidate: DATA_SERVICES_APR_MAX_AGE - 30 * 1000,
+    getFreshValue: async () => {
+      const invalid = invalidAprRanges.get(key);
+      if (invalid) throw invalid;
+
+      const { APR } = await queryPriceRangeApr({
+        lowerTickIndex: lowerTick,
+        upperTickIndex: upperTick,
+        poolId: poolId,
+      });
+      const apr = APR / 100;
+      // Throw rather than cache an unknown APR, so a bad response keeps the last good one.
+      if (isNaN(apr)) {
+        const error = new Error(`Invalid range APR for pool ${poolId}`);
+        invalidAprRanges.set(key, error);
+        throw error;
+      }
+      return new RatePretty(apr);
+    },
+  });
+}
+
+function maybeMakeRatePretty(value: number): RatePretty | undefined {
+  // numia will return 0 or null if the APR is not applicable, so return undefined to indicate that
+  if (value === 0 || value === null) {
+    return undefined;
+  }
+
+  return new RatePretty(new Dec(value).quo(new Dec(100)));
+}
+
+const incentivesCache = new LRUCache<string, CacheEntry>(DEFAULT_LRU_OPTIONS);
+
+export function getLockableDurations() {
+  // see: https://linear.app/osmosis/issue/FE-302/hardcode-lockable-durations-query-response
+  const lockable_durations = ["86400s", "604800s", "1209600s"];
+
+  return lockable_durations
+    .map((durationStr: string) => {
+      return dayjs.duration(
+        Number.parseInt(durationStr.replace("s", "")) * 1000
+      );
+    })
+    .sort((v1, v2) => {
+      return v1.asMilliseconds() > v2.asMilliseconds() ? 1 : -1;
+    });
+}
+
+/** Share of each epoch's provisions that is routed to pool incentives (0% on mainnet). */
+const POOL_INCENTIVES_PROVISIONS_SHARE = new Dec(0);
+
+/**
+ * Gets the daily OSMO emission of a pool's internal incentive gauge: epoch
+ * provisions × pool incentives share × the gauge's incentive percentage.
+ * Returns `null` when the pool receives no internal incentives.
+ */
+export function getPoolGaugeIncentives({
+  poolId,
+  chainList,
+  assetLists,
+}: {
+  poolId: string;
+  chainList: Chain[];
+  assetLists: AssetList[];
+}): Promise<{ coinPerDay: CoinPretty } | null> {
+  return cachified({
+    cache: incentivesCache,
+    key: `pool-gauge-incentives-${poolId}`,
+    ttl: 1000 * 60 * 10, // 10 mins
+    getFreshValue: async () => {
+      const [{ epoch_provisions }, { gauge_ids_with_duration }] =
+        await Promise.all([
+          queryEpochProvisions({ chainList }),
+          queryPoolGaugeIds({ chainList, poolId }),
+        ]);
+
+      // all gauges emit the same denom, so the last one with a share wins
+      const gauge = gauge_ids_with_duration
+        .filter(
+          ({ gauge_incentive_percentage }) =>
+            !new Dec(gauge_incentive_percentage).isZero()
+        )
+        .pop();
+      if (!gauge) return null;
+
+      const asset = getAsset({
+        assetLists,
+        anyDenom: chainList[0].stakeCurrency!.coinMinimalDenom,
+      });
+
+      return {
+        coinPerDay: new CoinPretty(
+          asset,
+          new Dec(epoch_provisions)
+            .mul(POOL_INCENTIVES_PROVISIONS_SHARE)
+            .mul(new Dec(gauge.gauge_incentive_percentage).quo(new Dec(100)))
+        ),
+      };
+    },
+  });
+}
+
+/** Gets internally incentivized pools with gauges that distribute minted staking tokens. */
+export function getIncentivizedPools({ chainList }: { chainList: Chain[] }) {
+  return cachified({
+    cache: incentivesCache,
+    key: "incentivized-pools",
+    ttl: 1000 * 60 * 10, // 10 mins
+    getFreshValue: async () => {
+      const { incentivized_pools } = await queryIncentivizedPools({
+        chainList,
+      });
+
+      return incentivized_pools.map((pool) => ({
+        pool_id: pool.pool_id,
+        lockable_duration: dayjs.duration(
+          Number.parseInt(pool.lockable_duration.replace("s", "")) * 1000
+        ),
+        gauge_id: pool.gauge_id,
+      }));
+    },
+  });
+}
+
+/** Gets gauges and filters those that are active. */
+export function getActiveGauges({ chainList }: { chainList: Chain[] }) {
+  return cachified({
+    cache: incentivesCache,
+    key: "active-external-gauges",
+    ttl: 1000 * 60 * 10, // 10 mins
+    getFreshValue: async () => {
+      const { data } = await queryGauges({ chainList });
+      const epochs = await getEpochs({ chainList });
+
+      return data
+        .filter(
+          (gauge) =>
+            !gauge.is_perpetual &&
+            gauge.distribute_to.denom.startsWith("gamm/pool") && // only gamm share incentives
+            !gauge.coins.some((coin) =>
+              coin.denom.match(/gamm\/pool\/[0-9]+/m)
+            ) && // no gamm share rewards
+            gauge.filled_epochs != gauge.num_epochs_paid_over && // no completed gauges
+            checkForStaleness(
+              gauge,
+              Number.parseInt(data[data.length - 1].id),
+              epochs
+            )
+        )
+        .map((gauge) => ({
+          ...gauge,
+          start_time: new Date(gauge.start_time),
+          distribute_to: {
+            ...gauge.distribute_to,
+            duration: dayjs.duration(
+              Number.parseInt(gauge.distribute_to.duration.replace("s", "")) *
+                1000
+            ),
+          },
+        }));
+    },
+  });
+}
+
+const DURATION_1_DAY = 86400000;
+const MAX_NEW_GAUGES_PER_DAY = 100;
+
+function checkForStaleness(gauge: Gauge, lastGaugeId: number, epochs: Epoch[]) {
+  const parsedGaugeStartTime = Date.parse(gauge.start_time);
+
+  const NOW = Date.now();
+  const CURRENT_EPOCH_START_TIME = epochs[0].startTime.getTime();
+
+  return (
+    gauge.distributed_coins.length > 0 ||
+    (parsedGaugeStartTime > NOW - DURATION_1_DAY &&
+      parsedGaugeStartTime < CURRENT_EPOCH_START_TIME + DURATION_1_DAY) ||
+    (parsedGaugeStartTime < NOW &&
+      Number.parseInt(gauge.id) > lastGaugeId - MAX_NEW_GAUGES_PER_DAY)
+  );
+}

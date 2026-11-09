@@ -1,0 +1,155 @@
+import type { MainWalletBase } from "@cosmos-kit/core";
+import type { CosmosRegistryWallet } from "@osmosis-labs/tx";
+import {
+  CosmosKitAccountsLocalStorageKey,
+  CosmosKitWalletLocalStorageKey,
+} from "@osmosis-labs/tx";
+import { isNil } from "@osmosis-labs/utils";
+import {
+  FunctionComponent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+
+import { EthereumChainIds } from "~/config/wagmi";
+import { CosmosWalletRegistry } from "~/config/wallet-registry";
+import { WalletSelectModal } from "~/modals";
+import { useStore } from "~/stores";
+import { createContext } from "~/utils/react-context";
+
+interface InstallPrevSessionWalletDeps {
+  walletRegistry: CosmosRegistryWallet[];
+  mainWallets: MainWalletBase[];
+  addWallet: (wallet: MainWalletBase) => any;
+}
+
+/**
+ * Attempts to restore a previously connected cosmos wallet from localStorage.
+ * If the persisted wallet name is no longer in the registry (e.g. after a wallet
+ * provider is sunset), the stale session is cleared so the user starts fresh.
+ */
+export async function installPrevSessionWallet({
+  walletRegistry,
+  mainWallets,
+  addWallet,
+}: InstallPrevSessionWalletDeps) {
+  const accountStr = localStorage.getItem(CosmosKitAccountsLocalStorageKey);
+
+  if (!accountStr || accountStr === "[]") {
+    localStorage.removeItem(CosmosKitAccountsLocalStorageKey);
+    localStorage.removeItem(CosmosKitWalletLocalStorageKey);
+    return;
+  }
+
+  const currentWallet = localStorage.getItem(CosmosKitWalletLocalStorageKey);
+
+  if (currentWallet) {
+    if (mainWallets.some((w) => w.walletInfo.name === currentWallet)) {
+      return;
+    }
+
+    const walletInfo = walletRegistry.find(
+      ({ name }) => name === currentWallet
+    );
+
+    if (!walletInfo) {
+      localStorage.removeItem(CosmosKitWalletLocalStorageKey);
+      localStorage.removeItem(CosmosKitAccountsLocalStorageKey);
+      return;
+    }
+
+    const WalletClass = await walletInfo.lazyInstall();
+    return addWallet(new WalletClass(walletInfo));
+  }
+}
+
+const [WalletSelectInnerProvider, useWalletSelect] = createContext<{
+  onOpenWalletSelect: (params: WalletSelectParams) => void;
+  isOpen: boolean;
+  isLoading: boolean;
+}>({
+  strict: true,
+  name: "WalletSelectContext",
+});
+
+export { useWalletSelect };
+
+export type WalletSelectOption =
+  | { walletType: "cosmos"; chainId: string }
+  | { walletType: "evm"; chainId?: EthereumChainIds };
+
+export interface WalletSelectParams {
+  walletOptions: WalletSelectOption[];
+  /**
+   * @default "full"
+   */
+  layout?: "list" | "full";
+  onConnect?: () => void;
+}
+
+export const WalletSelectProvider: FunctionComponent<{
+  children: ReactNode;
+}> = ({ children }) => {
+  const { walletRuntime } = useStore();
+
+  const [walletSelectParams, setWalletSelectParams] =
+    useState<WalletSelectParams | null>(null);
+  const [isWalletSelectOpen, setIsWalletSelectOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    const init = async () => {
+      try {
+        await installPrevSessionWallet({
+          walletRegistry: CosmosWalletRegistry,
+          mainWallets: walletRuntime.mainWallets,
+          addWallet: (w) => walletRuntime.installWallet(w),
+        });
+        // On mounted handles wallet connection if a session exists
+        if (!cancelled) await walletRuntime.mount();
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    init();
+
+    return () => {
+      cancelled = true;
+      walletRuntime.unmount();
+    };
+  }, [walletRuntime]);
+
+  const onOpenWalletSelect = useCallback((params: WalletSelectParams) => {
+    setIsWalletSelectOpen(true);
+    setWalletSelectParams(params);
+  }, []);
+
+  const context = useMemo(
+    () => ({ onOpenWalletSelect, isLoading, isOpen: isWalletSelectOpen }),
+    [isLoading, isWalletSelectOpen, onOpenWalletSelect]
+  );
+
+  return (
+    <WalletSelectInnerProvider value={context}>
+      {!isNil(walletSelectParams) &&
+        walletSelectParams.walletOptions.length > 0 && (
+          <WalletSelectModal
+            walletOptions={walletSelectParams.walletOptions}
+            onConnect={() => walletSelectParams.onConnect?.()}
+            isOpen={isWalletSelectOpen}
+            onRequestClose={() => {
+              setIsWalletSelectOpen(false);
+              setWalletSelectParams(null);
+            }}
+            layout={walletSelectParams?.layout}
+          />
+        )}
+      {children}
+    </WalletSelectInnerProvider>
+  );
+};

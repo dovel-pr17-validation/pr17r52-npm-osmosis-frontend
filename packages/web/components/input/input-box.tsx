@@ -1,0 +1,222 @@
+import classNames from "classnames";
+import {
+  FunctionComponent,
+  HTMLInputTypeAttribute,
+  useId,
+  useState,
+} from "react";
+import { Optional } from "utility-types";
+
+import { ButtonProps } from "~/components/buttons/types";
+import { AutosizeInput } from "~/components/input/autosize-input";
+import { CustomClasses, Disableable, InputProps } from "~/components/types";
+import { useControllableState } from "~/hooks/use-controllable-state";
+
+/* https://www.figma.com/file/wQjMyxY0EnEk29gBzGDMe5/Osmosis-Component?node-id=3938%3A15177 */
+
+/** Accessory button for the input box. */
+interface Button extends ButtonProps, CustomClasses, Disableable {
+  label: string;
+}
+
+type ClassVariants = "container" | "label" | "input" | "trailingSymbol";
+
+interface Props
+  extends
+    Optional<InputProps<string>, "currentValue">,
+    Disableable,
+    CustomClasses {
+  inputKey?: string;
+  /** Style of the component, see Figma. */
+  style?: "no-border" | "enabled" | "active" | "error";
+  type?: HTMLInputTypeAttribute;
+  /** Determine if input text is right justified. Setting to `true` will ignore all accessory buttons. */
+  rightEntry?: boolean;
+  /** Will only render the first two. If `clearButton` is enabled, will show that as long as `currentValue !== ""`. */
+  labelButtons?: Button[];
+  /** Show a clear button when `currentValue !== ""`. */
+  clearButton?: boolean;
+  /** Display a symbol after the input box, ex: '%'. */
+  trailingSymbol?: React.ReactNode;
+  /** @deprecated Use 'classes' instead */
+  inputClassName?: string;
+  isAutosize?: boolean;
+  inputRef?: React.MutableRefObject<HTMLInputElement | null>;
+  classes?: Partial<Record<ClassVariants, string>>;
+  styles?: Partial<Record<ClassVariants, React.CSSProperties>>;
+  onClick?: () => void;
+  /** Input mode for mobile keyboards. Use "decimal" for numeric inputs with decimal support. */
+  inputMode?:
+    | "none"
+    | "text"
+    | "tel"
+    | "url"
+    | "email"
+    | "numeric"
+    | "decimal"
+    | "search";
+}
+
+export const InputBox: FunctionComponent<Props> = ({
+  inputKey,
+  currentValue,
+  onInput,
+  onFocus,
+  onBlur,
+  placeholder,
+  style = "enabled",
+  type,
+  rightEntry = false,
+  labelButtons = [],
+  trailingSymbol,
+  inputClassName,
+  classes,
+  disabled = false,
+  className,
+  isAutosize,
+  inputRef,
+  autoFocus,
+  defaultValue,
+  styles,
+  onClick,
+  inputMode,
+}) => {
+  const inputId = useId();
+  const [inputFocused, setInputFocused] = useState(false);
+  const [inputValue, setValue] = useControllableState({
+    value: currentValue,
+    defaultValue,
+    onChange: onInput,
+  });
+
+  const inputClassName_ = classNames(
+    "md:leading-0 w-full appearance-none bg-transparent pt-px align-middle leading-10 placeholder:text-osmoverse-500 md:p-0",
+    {
+      "text-white-disabled": disabled,
+      "text-white-high": currentValue != "" && !disabled,
+      "float-right text-right": rightEntry,
+      "pr-1": !trailingSymbol,
+    },
+    classes?.input,
+    inputClassName
+  );
+
+  return (
+    <div
+      className={classNames(
+        "flex h-fit w-full flex-nowrap justify-between rounded-lg bg-osmoverse-1000 px-2 text-white-high",
+        {
+          border: style !== "no-border",
+          "border-osmoverse-200":
+            style !== "no-border" && (style === "active" || inputFocused),
+          "border-osmoverse-1000":
+            style !== "no-border" && style === "enabled" && !inputFocused,
+          "border-missionError": style === "error",
+          "cursor-default border-white-disabled bg-osmoverse-800": disabled,
+        },
+        className
+      )}
+      style={styles?.container}
+      onClick={onClick}
+    >
+      <label
+        className={classNames(
+          "flex w-full shrink grow items-center",
+          classes?.label
+        )}
+        style={styles?.label}
+        htmlFor={inputId}
+      >
+        {isAutosize ? (
+          // `type` is intentionally not forwarded: autosize inputs have always
+          // rendered as text, and `type="number"` reports "" for partial entries.
+          <AutosizeInput
+            key={inputKey}
+            inputRef={inputRef}
+            id={inputId}
+            placeholder={placeholder ?? ""}
+            autoComplete="off"
+            inputMode={inputMode}
+            disabled={disabled}
+            onWheel={(e) => (e.target as HTMLInputElement).blur()}
+            inputClassName={inputClassName_}
+            minWidth={0}
+            value={inputValue ?? ""}
+            onInput={(e) => setValue(e.currentTarget.value)}
+            onBlur={(e) => {
+              setInputFocused(false);
+              onBlur && onBlur(e);
+            }}
+            onFocus={(e) => {
+              setInputFocused(true);
+              onFocus && onFocus(e);
+            }}
+            autoFocus={autoFocus}
+            style={styles?.input}
+          />
+        ) : (
+          <input
+            key={inputKey}
+            ref={inputRef}
+            id={inputId}
+            className={inputClassName_}
+            value={currentValue}
+            placeholder={placeholder ?? ""}
+            autoComplete="off"
+            type={type}
+            inputMode={inputMode}
+            onWheel={(e) => (e.target as HTMLInputElement).blur()}
+            onBlur={(e: any) => {
+              setInputFocused(false);
+              onBlur && onBlur(e);
+            }}
+            onFocus={(e: any) => {
+              setInputFocused(true);
+              onFocus && onFocus(e);
+            }}
+            onInput={(e: any) => onInput(e.target.value)}
+            disabled={disabled}
+            autoFocus={autoFocus}
+            style={styles?.input}
+          />
+        )}
+        {trailingSymbol && (
+          <span
+            className={classes?.trailingSymbol}
+            style={styles?.trailingSymbol}
+          >
+            {trailingSymbol}
+          </span>
+        )}
+      </label>
+      <div className="flex flex-nowrap gap-2">
+        {!rightEntry &&
+          labelButtons
+            .slice(0, 2)
+            .map(
+              (
+                { label, onClick, disabled: labelButtonDisabled, className },
+                index
+              ) => (
+                <button
+                  key={index}
+                  className={classNames(
+                    "button mt-2.5 h-[1.375rem] select-none rounded-lg border-2 border-wosmongton-200 bg-wosmongton-200/30",
+                    {
+                      "opacity-30": disabled || labelButtonDisabled,
+                      "hover:bg-wosmongton-200/60":
+                        !disabled && !labelButtonDisabled,
+                    },
+                    className
+                  )}
+                  onClick={onClick}
+                  disabled={disabled || labelButtonDisabled}
+                >
+                  <span className="mx-2 text-caption">{label}</span>
+                </button>
+              )
+            )}
+      </div>
+    </div>
+  );
+};

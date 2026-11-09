@@ -1,0 +1,635 @@
+name: Preview frontend E2E tests
+
+# Runs against the Vercel preview built from the commit under test: for the
+# head commit of a non-draft PR (and when a draft is marked ready for review),
+# plus pushes to stage for post-merge validation. Draft PRs skip the suite
+# entirely — the preview E2E tests spend real funds on every run.
+#
+# PRs start from Vercel's deployment_status event rather than polling the
+# Vercel API. Stage can't: the monitoring workflows delete every GitHub
+# deployment on the stage head, so stage waits on Vercel's commit status for
+# its own SHA instead.
+on:
+  deployment_status:
+  pull_request:
+    types: [ready_for_review]
+  push:
+    branches:
+      - stage
+
+# deployment_status fires once per state change (pending, success, ...), so
+# collapse repeats for the same commit and state. Newer PR runs cancel older
+# ones on the same branch per job, via the job-level groups keyed on the
+# resolved branch. The event name keeps a push to stage apart from the
+# stage -> master release PR, whose head_ref is also "stage": sharing a group
+# let the release PR cancel the post-merge run for the stage head commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.deployment.sha || github.head_ref || github.ref_name }}-${{ github.event.deployment_status.state }}
+  cancel-in-progress: true
+
+# Every other job needs resolve-deployment and checks its `run` output (the
+# ones behind check-balances inherit it), so a skip there skips the suite.
+jobs:
+  resolve-deployment:
+    if: >-
+      github.event_name == 'push'
+      || (github.event_name == 'deployment_status'
+        && github.event.deployment_status.state == 'success'
+        && github.event.deployment.environment == 'Preview – osmosis-frontend')
+      || (github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.fork == false
+        && github.event.pull_request.head.ref != 'stage')
+    runs-on: ubuntu-latest
+    permissions:
+      # To cancel runs for superseded commits of the same PR.
+      actions: write
+      contents: read
+      deployments: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      run: ${{ steps.resolve.outputs.run }}
+      branch: ${{ steps.resolve.outputs.branch }}
+      environment_url: ${{ steps.resolve.outputs.environment_url }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.event.deployment.sha || github.event.pull_request.head.sha || github.sha }}
+          DEPLOYMENT_URL: ${{ github.event.deployment_status.environment_url }}
+          PREVIEW_ENV: "Preview – osmosis-frontend"
+          VERCEL_STATUS_CONTEXT: "Vercel – osmosis-frontend"
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "Skipping E2E: $1" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if [ "$EVENT" = "push" ]; then
+            # Wait up to 20 min for Vercel's commit status on this exact SHA.
+            # Its target_url is the dashboard page, whose last path segment is
+            # the deployment id.
+            for _ in $(seq 1 60); do
+              STATUS=$(gh api "repos/$REPO/commits/$SHA/statuses?per_page=100" \
+                --jq "[.[] | select(.context == \"$VERCEL_STATUS_CONTEXT\")][0] // empty | \"\(.state) \(.target_url)\"")
+              case "${STATUS%% *}" in
+                success) break ;;
+                failure | error) echo "Vercel deployment failed: ${STATUS#* }"; exit 1 ;;
+              esac
+              sleep 20
+            done
+            [ "${STATUS%% *}" = "success" ] || { echo "Timed out waiting for the Vercel deployment of $SHA."; exit 1; }
+            DEPLOYMENT_ID="${STATUS##*/}"
+            DEPLOYMENT=$(curl -fsS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v13/deployments/dpl_${DEPLOYMENT_ID}")
+            [ "$(jq -r '.readyState' <<< "$DEPLOYMENT")" = "READY" ] ||
+              skip "Vercel deployment dpl_$DEPLOYMENT_ID is $(jq -r '.readyState' <<< "$DEPLOYMENT") (build skipped?)."
+            DEPLOYMENT_URL=$(jq -r '.url' <<< "$DEPLOYMENT")
+            BRANCH=stage
+          else
+            # Marked ready for review: wait up to 20 min for the head commit's
+            # preview instead of skipping. Skipped jobs count as passing
+            # required checks, so a skip would leave the PR mergeable untested
+            # until the preview finished building.
+            if [ "$EVENT" = "pull_request" ]; then
+              for _ in $(seq 1 60); do
+                DEPLOYMENT_ID=$(gh api "repos/$REPO/deployments?sha=$SHA" \
+                  --jq "[.[] | select(.environment == \"$PREVIEW_ENV\")][0].id // empty")
+                if [ -n "$DEPLOYMENT_ID" ]; then
+                  STATUS=$(gh api "repos/$REPO/deployments/$DEPLOYMENT_ID/statuses" \
+                    --jq '[.[] | select(.state == "success" or .state == "failure" or .state == "error")][0] // empty | "\(.state) \(.environment_url)"')
+                  case "${STATUS%% *}" in
+                    success) DEPLOYMENT_URL="${STATUS#* }"; break ;;
+                    failure | error) echo "Vercel preview for $SHA failed."; exit 1 ;;
+                  esac
+                fi
+                sleep 20
+              done
+              [ -n "$DEPLOYMENT_URL" ] || { echo "Timed out waiting for the Vercel preview of $SHA."; exit 1; }
+            fi
+
+            # Only test the latest commit of an open PR. Deployments of
+            # superseded commits that finish late are skipped, as are stage
+            # deployments, which the push trigger above handles. The head.ref
+            # filter is what excludes stage explicitly: deployment.ref is the
+            # SHA, not the branch, and this endpoint only leaves out the open
+            # stage -> master release PR while stage is the default branch.
+            PR=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+              --jq "[.[] | select(.state == \"open\" and .head.sha == \"$SHA\" and .head.ref != \"stage\")][0] // empty")
+            [ -n "$PR" ] || skip "$SHA is not the head of an open PR."
+            [ "$(jq -r '.draft' <<< "$PR")" = "false" ] || skip "PR is a draft."
+            # Fork PRs have no access to the E2E secrets.
+            [ "$(jq -r '.head.repo.fork' <<< "$PR")" = "false" ] || skip "PR is from a fork."
+            BRANCH=$(jq -r '.head.ref' <<< "$PR")
+
+            # Cancel in-progress runs for earlier commits of this PR. The
+            # job-level groups only cancel the same job in an older run, so an
+            # older run's later jobs could still share the E2E wallet with
+            # this one.
+            PR_SHAS=$(gh api --paginate "repos/$REPO/pulls/$(jq -r '.number' <<< "$PR")/commits?per_page=100" --jq '.[].sha')
+            gh run list -R "$REPO" --workflow frontend-e2e-tests.yml --limit 100 \
+              --json databaseId,headSha,status \
+              --jq '.[] | select(.status != "completed") | "\(.databaseId) \(.headSha)"' |
+              while read -r RUN_ID RUN_SHA; do
+                if [ "$RUN_SHA" != "$SHA" ] && grep -qx "$RUN_SHA" <<< "$PR_SHAS"; then
+                  echo "Cancelling run $RUN_ID for superseded commit $RUN_SHA."
+                  gh run cancel -R "$REPO" "$RUN_ID" || true
+                fi
+              done
+          fi
+
+          echo "Vercel deployment: $DEPLOYMENT_URL ($BRANCH)" | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "run=true"
+            echo "branch=$BRANCH"
+            echo "environment_url=${DEPLOYMENT_URL#https://}"
+          } >> "$GITHUB_OUTPUT"
+
+  check-balances:
+    needs: resolve-deployment
+    if: needs.resolve-deployment.outputs.run == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-check-balances
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install dependencies
+        run: yarn workspaces focus app-osmosis-e2e
+      - name: Check account balances
+        id: balance-check
+        continue-on-error: true
+        env:
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          ACCOUNT_LABEL: "E2E Test Account"
+        run: yarn --cwd packages/e2e check-balances
+      - name: Extract balance details
+        id: balance-details
+        if: steps.balance-check.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          if [ -f packages/e2e/balance-report.json ]; then
+            echo "is_balance_issue=true" >> "$GITHUB_OUTPUT"
+            SUMMARY=$(jq -r '[.details[] | ltrimstr("  ")] | join("\\n")' packages/e2e/balance-report.json)
+            ADDRESS=$(jq -r '.address // ""' packages/e2e/balance-report.json)
+            OUTCOME=$(jq -r '.outcome // "warn"' packages/e2e/balance-report.json)
+            echo "summary=${SUMMARY}" >> "$GITHUB_OUTPUT"
+            echo "address=${ADDRESS}" >> "$GITHUB_OUTPUT"
+            echo "outcome=${OUTCOME}" >> "$GITHUB_OUTPUT"
+            echo "is_balance_issue=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "summary=Balance check script crashed (not a balance issue)." >> "$GITHUB_OUTPUT"
+            echo "outcome=error" >> "$GITHUB_OUTPUT"
+            echo "is_balance_issue=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Send low-balance Slack alert
+        if: steps.balance-check.outcome == 'failure' && steps.balance-details.outputs.is_balance_issue == 'true'
+        continue-on-error: true
+        uses: slackapi/slack-github-action@v3
+        with:
+          webhook: ${{ secrets.E2E_SLACK_WEBHOOK_BALANCE_ALERTS }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "text": "${{ steps.balance-details.outputs.outcome == 'fail' && '🚨 E2E Critical Balance Alert' || '⚠️ E2E Low Balance Warning' }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": "${{ steps.balance-details.outputs.outcome == 'fail' && '🚨 E2E Critical Balance Alert' || '⚠️ E2E Low Balance Warning' }}", "emoji": true }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Account:* E2E Preview Test Account\n*Address:* ${{ steps.balance-details.outputs.address }}\n*Shortages:*\n${{ steps.balance-details.outputs.summary }}\n*Workflow:* frontend-e2e-tests / check-balances\n*Details:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run logs>"
+                  }
+                }
+              ]
+            }
+      # Auto-dispatch a topup when the preview account is low. The cooldown
+      # guard below is keyed off recent "E2E: Topup Test Accounts" runs so
+      # repeated preview pushes do not each broadcast a topup.
+      - name: Trigger automatic topup
+        if: steps.balance-check.outcome == 'failure'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f packages/e2e/balance-report.json ]; then
+            OUTCOME=$(jq -r '.outcome // ""' packages/e2e/balance-report.json)
+            if [ "$OUTCOME" = "warn" ] || [ "$OUTCOME" = "fail" ]; then
+              # Dedup guard (Phase A / MTN-97): skip if a topup is already in
+              # flight, OR a real (non-dry-run) successful topup was *created*
+              # (`createdAt`, i.e. dispatched/queued) within the ~45 min cooldown.
+              # The window is keyed off createdAt (≈ dispatch time), not the
+              # completion time, since the intent is to rate-limit how often we
+              # dispatch. 45 min is deliberately below the 60 min monitoring cron
+              # so a still-low account is still refilled on the next hourly tick;
+              # the window only collapses same-tick and cross-workflow bursts.
+              # Failed runs do NOT count (so a bad topup can be retried
+              # immediately); dry runs do NOT count (no funds move). Note this is
+              # a best-effort, non-atomic check — two dispatchers firing in the
+              # same instant can still both dispatch.
+              COOLDOWN_SECONDS=2700
+              RECENT=$(gh run list --workflow "E2E: Topup Test Accounts" --limit 50 \
+                --json status,conclusion,displayTitle,createdAt \
+                --jq "[.[]
+                  | select((.displayTitle | startswith(\"Dry run\")) | not)
+                  | select(
+                      .status == \"queued\" or .status == \"in_progress\"
+                      or (.conclusion == \"success\" and ((now - (.createdAt | fromdateiso8601)) < $COOLDOWN_SECONDS))
+                    )] | length" || echo "")
+              # Fail open (MTN-110): if the gh/jq lookup errored, RECENT is
+              # empty/non-numeric — treat it as "nothing recent" and dispatch
+              # rather than silently skip. A duplicate topup is harmless (the
+              # script re-checks balances and only sends deficits); a skipped
+              # dispatch is the starvation bug this guard exists to prevent.
+              if ! [[ "$RECENT" =~ ^[0-9]+$ ]]; then
+                echo "Topup cooldown lookup failed (gh/jq) — proceeding to dispatch."
+                RECENT=0
+              fi
+              if [ "$RECENT" -gt 0 ]; then
+                echo "Recent successful or in-flight topup within cooldown — skipping dispatch."
+              else
+                # reserve_usdc guards allUSDC after the identity handover, and the
+                # converted alloy balance is far smaller than the old Noble one, so
+                # a 250/500 reserve left nothing distributable. Kept at the 100/3.0
+                # the other dispatchers use, which is what the README documents and
+                # what sweep-surplus's TOPUP_TARGET_MULTIPLIER assumes.
+                gh workflow run "E2E: Topup Test Accounts" \
+                  --ref stage \
+                  -f dry_run=false \
+                  -f topup_multiplier=3.0 \
+                  -f reserve_osmo=5 \
+                  -f reserve_usdc=100
+                echo "Topup workflow dispatched (balance outcome: $OUTCOME)."
+              fi
+            else
+              echo "Skipping topup — balance outcome: $OUTCOME"
+            fi
+          else
+            echo "Skipping topup — no balance report found."
+          fi
+      - name: Fail if balance critically low
+        if: always() && steps.balance-check.outcome == 'failure'
+        run: |
+          if [ -f packages/e2e/balance-report.json ]; then
+            OUTCOME=$(jq -r '.outcome' packages/e2e/balance-report.json)
+            if [ "$OUTCOME" = "fail" ]; then
+              echo "Critical balance shortage — blocking test run."
+              exit 1
+            fi
+            echo "Low balance warning — proceeding with tests."
+          else
+            echo "Balance check failed but no report — proceeding with tests."
+          fi
+
+  preview-swap-osmo-tests:
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-preview-swap-osmo-tests
+      cancel-in-progress: true
+    timeout-minutes: 15
+    runs-on: macos-26
+    needs: [resolve-deployment, check-balances]
+    outputs:
+      unexpected: ${{ steps.set-output.outputs.unexpected }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: print environment_url and BRANCH_NAME
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          BRANCH_NAME: ${{ needs.resolve-deployment.outputs.branch }}
+        run: |
+          echo "$BASE_URL"
+          echo "$BRANCH_NAME"
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install Playwright
+        run: |
+          echo "$GITHUB_OUTPUT"
+          yarn workspaces focus app-osmosis-e2e && npx playwright install --with-deps chromium
+      - name: Check E2E tooling
+        working-directory: packages/e2e
+        run: yarn typecheck && yarn test:tooling
+      - name: Run Swap Pair tests
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          # Linux-headless mode (PR #4319) — disabled in favour of macos-26 above due to
+          # Keplr extension popup flakiness in headless Chromium on Linux. To retry the
+          # cheaper Linux runner, switch `runs-on:` to `ubuntu-latest` and uncomment:
+          # HEADLESS: "true"
+        run: |
+          cd packages/e2e
+          npx playwright test swap.osmo.wallet
+      - name: set-output
+        if: failure() || success()
+        id: set-output
+        run: |
+          echo "unexpected=$(jq -r '.stats.unexpected' packages/e2e/playwright-report/test-results.json)"
+          echo "unexpected=$(jq -r '.stats.unexpected' packages/e2e/playwright-report/test-results.json)" >> $GITHUB_OUTPUT
+      - name: upload Swap test results
+        if: failure() || success()
+        id: swap-test-results
+        uses: actions/upload-artifact@v6
+        with:
+          name: osmo-swap-test-results
+          path: packages/e2e/playwright-report
+
+  preview-swap-usdc-tests:
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-preview-swap-usdc-tests
+      cancel-in-progress: true
+    timeout-minutes: 15
+    runs-on: macos-26
+    needs: [resolve-deployment, preview-swap-osmo-tests, check-balances]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: print environment_url and BRANCH_NAME
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          BRANCH_NAME: ${{ needs.resolve-deployment.outputs.branch }}
+        run: |
+          echo "$BASE_URL"
+          echo "$BRANCH_NAME"
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install Playwright
+        run: |
+          echo "$GITHUB_OUTPUT"
+          yarn workspaces focus app-osmosis-e2e && npx playwright install --with-deps chromium
+      - name: Run Swap Pair tests
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          # Linux-headless mode (PR #4319) — disabled in favour of macos-26 above due to
+          # Keplr extension popup flakiness in headless Chromium on Linux. To retry the
+          # cheaper Linux runner, switch `runs-on:` to `ubuntu-latest` and uncomment:
+          # HEADLESS: "true"
+        run: |
+          cd packages/e2e
+          npx playwright test swap.usdc.wallet
+      - name: upload Swap test results
+        if: failure() || success()
+        id: swap-test-results
+        uses: actions/upload-artifact@v6
+        with:
+          name: usdc-swap-test-results
+          path: packages/e2e/playwright-report
+
+  preview-portfolio-trx-tests:
+    if: needs.resolve-deployment.outputs.run == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-preview-portfolio-trx-tests
+      cancel-in-progress: true
+    timeout-minutes: 10
+    needs: resolve-deployment
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install Playwright
+        run: |
+          yarn workspaces focus app-osmosis-e2e && npx playwright install --with-deps chromium
+      - name: Run Portfolio tests
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          # Linux-headless mode (PR #4319) — disabled in favour of macos-26 above due to
+          # Keplr extension popup flakiness in headless Chromium on Linux. To retry the
+          # cheaper Linux runner, switch `runs-on:` to `ubuntu-latest` and uncomment:
+          # HEADLESS: "true"
+        run: |
+          cd packages/e2e
+          npx playwright test portfolio transactions
+      - name: upload Portfolio and transactions test results
+        if: failure()
+        id: portfolio-test-results
+        uses: actions/upload-artifact@v6
+        with:
+          name: preview-portfolio-trx-test-results
+          path: packages/e2e/playwright-report
+
+  preview-pools-and-select-pair-tests:
+    if: needs.resolve-deployment.outputs.run == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-preview-pools-and-select-pair-tests
+      cancel-in-progress: true
+    # 15, matching the other long suites. What pushed this job past 10 was the
+    # two pool tests that hung once the Noble pools were renamed (fixed in this
+    # PR): two tests times two attempts times a 90s timeout is six minutes of
+    # dead time, which is almost exactly the gap between the 11m09s failing run
+    # and the 5m42s it takes with them passing.
+    #
+    # Kept at 15 rather than restored to 10, because the margin was already too
+    # thin before any of that: the last consistently passing runs, on 26 August,
+    # ranged from 5m31s to 9m17s, leaving 43 seconds under a 10 minute cap.
+    timeout-minutes: 15
+    needs: resolve-deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install Playwright
+        run: |
+          yarn workspaces focus app-osmosis-e2e && npx playwright install --with-deps chromium
+      - name: Run Pools tests
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+        run: |
+          cd packages/e2e
+          npx playwright test pools select
+      - name: upload pools test results
+        if: failure()
+        id: pools-test-results
+        uses: actions/upload-artifact@v6
+        with:
+          name: preview-pools-test-results
+          path: packages/e2e/playwright-report
+
+  preview-trade-tests:
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-preview-trade-tests
+      cancel-in-progress: true
+    timeout-minutes: 15
+    runs-on: macos-26
+    needs:
+      [
+        resolve-deployment,
+        preview-swap-osmo-tests,
+        preview-swap-usdc-tests,
+        check-balances,
+      ]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install Playwright
+        run: |
+          echo "$GITHUB_OUTPUT"
+          yarn workspaces focus app-osmosis-e2e && npx playwright install --with-deps chromium
+      - name: Cancel leftover open orders
+        continue-on-error: true
+        env:
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          ACCOUNT_LABEL: "E2E Test Account (pre-test cleanup)"
+          # The wallet is shared by runs on other branches. Only clear orders
+          # older than this job's 15 min timeout, so another run's in-flight
+          # test orders are left alone.
+          MIN_ORDER_AGE_MINUTES: "20"
+        run: npx tsx packages/e2e/scripts/cancel-all-orders.ts
+      - name: Run Swap Pair tests
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          # Linux-headless mode (PR #4319) — disabled in favour of macos-26 above due to
+          # Keplr extension popup flakiness in headless Chromium on Linux. To retry the
+          # cheaper Linux runner, switch `runs-on:` to `ubuntu-latest` and uncomment:
+          # HEADLESS: "true"
+        run: |
+          cd packages/e2e
+          npx playwright test trade
+      - name: upload Trade test results
+        if: failure()
+        id: preview-trade-test-results
+        uses: actions/upload-artifact@v6
+        with:
+          name: preview-trade-test-results
+          path: packages/e2e/playwright-report
+
+  preview-claim-tests:
+    concurrency:
+      group: ${{ github.workflow }}-${{ needs.resolve-deployment.outputs.branch }}-preview-claim-tests
+      cancel-in-progress: true
+    timeout-minutes: 10
+    runs-on: macos-26
+    needs: [resolve-deployment, check-balances]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /package.json
+            /yarn.lock
+            /.yarnrc.yml
+            /.yarn-4.18.1.cjs
+            /packages/*/package.json
+            /packages/e2e/
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          package-manager-cache: false
+          node-version: 24.x
+      - name: Install Playwright
+        run: |
+          echo "$GITHUB_OUTPUT"
+          yarn workspaces focus app-osmosis-e2e && npx playwright install --with-deps chromium
+      - name: Run Claim tests
+        env:
+          BASE_URL: "https://${{ needs.resolve-deployment.outputs.environment_url }}"
+          PRIVATE_KEY: ${{ secrets.E2E_PRIVATE_KEY_PREVIEW }}
+          # Linux-headless mode (PR #4319) — disabled in favour of macos-26 above due to
+          # Keplr extension popup flakiness in headless Chromium on Linux. To retry the
+          # cheaper Linux runner, switch `runs-on:` to `ubuntu-latest` and uncomment:
+          # HEADLESS: "true"
+        run: |
+          cd packages/e2e
+          npx playwright test claim
+      - name: upload Claim test results
+        if: failure()
+        id: claim-test-results
+        uses: actions/upload-artifact@v6
+        with:
+          name: preview-claim-test-results
+          path: packages/e2e/playwright-report
